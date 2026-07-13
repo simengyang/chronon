@@ -3,15 +3,17 @@ package ai.chronon.flink.window
 import ai.chronon.aggregator.windowing.{
   EvictionTimes,
   FinalBatchIr,
+  GigaEmitResult,
   GigaTileStore,
   GigaTileStreamProcessor,
   MegaTileAggregator
 }
 import ai.chronon.api.{Constants, DataType, GroupBy, TsUtils}
 import ai.chronon.api.ScalaJavaConversions.IteratorOps
-import ai.chronon.flink.SparkExpressionEval
+import ai.chronon.flink.{FlinkJob, SparkExpressionEval}
 import ai.chronon.flink.deser.ProjectedEvent
 import ai.chronon.flink.types.{BatchIrRow, TimestampedTile}
+import ai.chronon.flink.window.ChrononClockMode.{Catchup, Horizons, Live, Mode, NoWatermark}
 import ai.chronon.online.{GigaTileCodec, MegaTileCodec}
 import ai.chronon.online.serde.ArrayRow
 import org.apache.flink.api.common.state.{MapState, MapStateDescriptor, ValueState, ValueStateDescriptor}
@@ -48,6 +50,7 @@ class GigaTileProcessFunction(
 
   @transient private var eventProcessingErrorCounter: Counter = _
   @transient private var batchUpdateCounter: Counter = _
+  @transient private var futureEventDropCounter: Counter = _
   @transient private var lastKey: java.util.List[Any] = _
 
   private val valueColumns: Array[String] = inputSchema.map(_._1).toArray
@@ -67,6 +70,13 @@ class GigaTileProcessFunction(
   private var lastLargeRecomputeAsOfTsState: ValueState[java.lang.Long] = _
   private var lastEmittedVersionState: ValueState[java.lang.Long] = _
   private var pendingVersionCollisionState: ValueState[java.lang.Long] = _
+  private var pendingPublicationState: ValueState[java.lang.Boolean] = _
+  private var pendingPublicationRetryTimerState: ValueState[java.lang.Long] = _
+  private var pendingPublicationActivationTimerState: ValueState[java.lang.Long] = _
+
+  private val publicationRetryDelayMillis = math.max(1L, 2L * FlinkJob.AutoWatermarkInterval)
+  private val activationCooldownDelayMillis =
+    math.max(publicationRetryDelayMillis, FlinkJob.CatchupWatermarkLagSlackMillis / 2L)
 
   override def open(parameters: Configuration): Unit = {
     super.open(parameters)
@@ -76,6 +86,7 @@ class GigaTileProcessFunction(
       .addGroup("feature_group", groupBy.getMetaData.getName)
     eventProcessingErrorCounter = metricsGroup.counter("event_processing_error")
     batchUpdateCounter = metricsGroup.counter("batch_update_count")
+    futureEventDropCounter = metricsGroup.counter("future_event_drop_count")
 
     tileState = getRuntimeContext.getMapState(
       new MapStateDescriptor[String, Array[Byte]]("giga-tile-tiles", classOf[String], classOf[Array[Byte]]))
@@ -105,6 +116,13 @@ class GigaTileProcessFunction(
       new ValueStateDescriptor[java.lang.Long]("giga-tile-last-emitted-version", classOf[java.lang.Long]))
     pendingVersionCollisionState = getRuntimeContext.getState(
       new ValueStateDescriptor[java.lang.Long]("giga-tile-pending-version-collision", classOf[java.lang.Long]))
+    pendingPublicationState = getRuntimeContext.getState(
+      new ValueStateDescriptor[java.lang.Boolean]("giga-tile-pending-publication", classOf[java.lang.Boolean]))
+    pendingPublicationRetryTimerState = getRuntimeContext.getState(
+      new ValueStateDescriptor[java.lang.Long]("giga-tile-pending-publication-retry-pt-timer", classOf[java.lang.Long]))
+    pendingPublicationActivationTimerState = getRuntimeContext.getState(
+      new ValueStateDescriptor[java.lang.Long]("giga-tile-pending-publication-activation-et-timer",
+                                               classOf[java.lang.Long]))
 
     initializeTransients()
   }
@@ -141,11 +159,214 @@ class GigaTileProcessFunction(
     }
   }
 
-  // Small-window ranges use an exclusive upper bound. At an exact hop, nudge only that
-  // horizon so the just-opened tile remains visible; large windows keep the real time.
-  private def adjustedSmallWindowAsOfTs(asOfTs: Long): Long =
-    if (asOfTs < Long.MaxValue && asOfTs == TsUtils.round(asOfTs, processor.minSmallWindowTileSize)) asOfTs + 1L
-    else asOfTs
+  private def currentClockMode(currentProcessingTime: Long, eventTimeWatermark: Long): Mode =
+    ChrononClockMode.classify(currentProcessingTime,
+                              eventTimeWatermark,
+                              FlinkJob.AllowedOutOfOrderness.toMillis,
+                              FlinkJob.LiveWatermarkLagToleranceMillis)
+
+  private def isFutureEvent(eventTime: Long, currentProcessingTime: Long): Boolean =
+    eventTime > currentProcessingTime
+
+  private def hasPendingPublication: Boolean =
+    java.lang.Boolean.TRUE.equals(pendingPublicationState.value()) && pendingVersionCollisionState.value() == null
+
+  private def schedulePublicationRetryIfNeeded(
+      timerService: TimerService,
+      currentProcessingTime: Long
+  ): Unit =
+    schedulePublicationRetryAfterIfNeeded(timerService, currentProcessingTime, publicationRetryDelayMillis)
+
+  private def schedulePublicationRetryAfterIfNeeded(
+      timerService: TimerService,
+      currentProcessingTime: Long,
+      delayMillis: Long
+  ): Unit = {
+    if (!hasPublicationWakeupTimer && currentProcessingTime <= Long.MaxValue - delayMillis) {
+      val retryTimestamp = currentProcessingTime + delayMillis
+      timerService.registerProcessingTimeTimer(retryTimestamp)
+      pendingPublicationRetryTimerState.update(retryTimestamp)
+    }
+  }
+
+  private def schedulePublicationRetryAtIfNeeded(
+      timerService: TimerService,
+      currentProcessingTime: Long,
+      retryTimestamp: Long
+  ): Unit = {
+    if (!hasPublicationWakeupTimer && retryTimestamp > currentProcessingTime) {
+      timerService.registerProcessingTimeTimer(retryTimestamp)
+      pendingPublicationRetryTimerState.update(retryTimestamp)
+    }
+  }
+
+  private def hasPublicationWakeupTimer: Boolean =
+    pendingPublicationRetryTimerState.value() != null || pendingPublicationActivationTimerState.value() != null
+
+  private def nextPublicationActivationWatermark(currentProcessingTime: Long): Option[Long] = {
+    val liveWatermarkLagMillis = FlinkJob.LiveWatermarkLagToleranceMillis
+    if (currentProcessingTime < Long.MinValue + liveWatermarkLagMillis) None
+    else Some(currentProcessingTime - liveWatermarkLagMillis)
+  }
+
+  private def firstSafeProcessingTimeAfterFutureWatermark(eventTimeWatermark: Long): Option[Long] = {
+    val outOfOrdernessMillis = FlinkJob.AllowedOutOfOrderness.toMillis
+    if (eventTimeWatermark > Long.MaxValue - outOfOrdernessMillis) None
+    else {
+      val lastUnsafeProcessingTime = eventTimeWatermark + outOfOrdernessMillis
+      if (lastUnsafeProcessingTime == Long.MaxValue) None else Some(lastUnsafeProcessingTime + 1L)
+    }
+  }
+
+  private def schedulePublicationActivationIfNeeded(
+      timerService: TimerService,
+      currentProcessingTime: Long,
+      eventTimeWatermark: Long
+  ): Unit = {
+    if (!hasPublicationWakeupTimer) {
+      nextPublicationActivationWatermark(currentProcessingTime)
+        .filter(_ > eventTimeWatermark)
+        .foreach { activationWatermark =>
+          timerService.registerEventTimeTimer(activationWatermark)
+          pendingPublicationActivationTimerState.update(activationWatermark)
+        }
+    }
+  }
+
+  private def scheduleFencedPublicationWakeupIfNeeded(
+      timerService: TimerService,
+      currentProcessingTime: Long,
+      eventTimeWatermark: Long,
+      mode: Mode
+  ): Unit =
+    mode match {
+      case Catchup =>
+        schedulePublicationActivationIfNeeded(timerService, currentProcessingTime, eventTimeWatermark)
+      case NoWatermark if eventTimeWatermark == Long.MinValue =>
+        schedulePublicationActivationIfNeeded(timerService, currentProcessingTime, eventTimeWatermark)
+      case NoWatermark =>
+        // Watermarks never move backward. A future-poisoned watermark becomes safe at one
+        // exact wall-clock boundary, so avoid polling every pending key while time catches up.
+        firstSafeProcessingTimeAfterFutureWatermark(eventTimeWatermark)
+          .foreach { retryTimestamp =>
+            schedulePublicationRetryAtIfNeeded(timerService, currentProcessingTime, retryTimestamp)
+          }
+      case Live => ()
+    }
+
+  private def clearPublicationRetryMarker(): Unit =
+    pendingPublicationRetryTimerState.clear()
+
+  private def clearExpiredPublicationRetryMarker(
+      currentProcessingTime: Long,
+      currentTimerCallback: Option[(TimeDomain, Long)]
+  ): Boolean = {
+    val retryTimestamp = pendingPublicationRetryTimerState.value()
+    if (
+      retryTimestamp != null && processingTimerMarkerIsExpired(retryTimestamp.longValue(),
+                                                               currentProcessingTime,
+                                                               currentTimerCallback)
+    ) {
+      pendingPublicationRetryTimerState.clear()
+      true
+    } else {
+      false
+    }
+  }
+
+  private def clearPublicationWakeupMarkers(): Unit = {
+    pendingPublicationRetryTimerState.clear()
+    pendingPublicationActivationTimerState.clear()
+  }
+
+  private def isCurrentPublicationRetryTimer(timestamp: Long): Boolean =
+    Option(pendingPublicationRetryTimerState.value()).exists(_.longValue() == timestamp)
+
+  private def isCurrentPublicationActivationTimer(timestamp: Long): Boolean =
+    Option(pendingPublicationActivationTimerState.value()).exists(_.longValue() == timestamp)
+
+  private def shouldPublish(
+      mode: Mode,
+      horizons: Horizons,
+      currentProcessingTime: Long
+  ): Boolean = {
+    val currentDayStart = flinkStore.getCurrentDayStart
+    ChrononClockMode.allowsPublication(mode) &&
+    horizons.largeWindowAsOfMillis == currentProcessingTime &&
+    !(currentDayStart >= 0L && flinkStore.getBatchEndTs > currentDayStart)
+  }
+
+  private def advanceDayForMode(
+      mode: Mode,
+      currentProcessingTime: Long,
+      eventTimeWatermark: Long
+  ): GigaEmitResult =
+    ChrononClockMode
+      .dayAdvanceAsOfMillis(mode, currentProcessingTime, eventTimeWatermark)
+      .map(processor.advanceDayAsOf)
+      .getOrElse(GigaEmitResult(null))
+
+  private def preferLatestResult(primary: GigaEmitResult, fallback: GigaEmitResult): GigaEmitResult =
+    if (primary.finalizedVector != null || fallback.finalizedVector == null) primary else fallback
+
+  private def rebuildPendingAtCurrentTime(
+      mode: Mode,
+      horizons: Horizons,
+      currentProcessingTime: Long
+  ): Option[GigaEmitResult] =
+    if (hasPendingPublication && shouldPublish(mode, horizons, currentProcessingTime)) {
+      Some(
+        processor.onEviction(
+          EvictionTimes(timerTs = horizons.largeWindowAsOfMillis, smallWindowAsOfTs = horizons.smallWindowAsOfMillis)))
+    } else {
+      None
+    }
+
+  private def emitOrDefer(
+      mode: Mode,
+      horizons: Horizons,
+      result: GigaEmitResult,
+      currentKey: java.util.List[Any],
+      currentProcessingTime: Long,
+      startProcessingTime: Long,
+      timerService: TimerService,
+      out: Collector[TimestampedTile],
+      scheduleWatermarkRetry: Boolean
+  ): Unit = {
+    if (!shouldPublish(mode, horizons, currentProcessingTime)) {
+      val publicationPending = result.finalizedVector != null || result.needsEvictionTimer || hasPendingPublication
+      if (publicationPending) {
+        pendingPublicationState.update(java.lang.Boolean.TRUE)
+        if (scheduleWatermarkRetry) schedulePublicationRetryIfNeeded(timerService, currentProcessingTime)
+      }
+      return
+    }
+
+    val finalizedVector =
+      if (result.finalizedVector != null) result.finalizedVector
+      else if (hasPendingPublication) processor.currentSnapshot.finalizedVector
+      else null
+
+    if (finalizedVector != null) {
+      // This covers encoding and Collector handoff only. The downstream async KV result is
+      // outside this keyed operator and cannot acknowledge or retry through this state.
+      pendingPublicationState.update(java.lang.Boolean.TRUE)
+      try {
+        emitOrCoalesceVersionCollision(timerService,
+                                       finalizedVector,
+                                       currentKey,
+                                       currentProcessingTime,
+                                       startProcessingTime,
+                                       out)
+        if (pendingVersionCollisionState.value() == null) pendingPublicationState.clear()
+        clearPublicationWakeupMarkers()
+      } catch {
+        case e: Exception =>
+          logger.error(s"Error emitting giga tile for groupBy=${groupBy.getMetaData.getName}", e)
+          eventProcessingErrorCounter.inc()
+      }
+    }
+  }
 
   /** Processing-time callbacks can share a millisecond. Coalesce later same-millisecond updates
     * behind a timer so emitted versions are strictly increasing before async sink handoff.
@@ -285,9 +506,36 @@ class GigaTileProcessFunction(
     }
   }
 
+  private def postponeVersionCollision(
+      timerService: TimerService,
+      currentProcessingTime: Long,
+      currentTimerCallback: Option[(TimeDomain, Long)]
+  ): Unit = {
+    if (pendingVersionCollisionState.value() != null) {
+      val trackedEviction = nextProcessingEvictionTimerState.value()
+      val retryVersion =
+        if (
+          trackedEviction != null && !processingTimerMarkerIsExpired(trackedEviction.longValue(),
+                                                                     currentProcessingTime,
+                                                                     currentTimerCallback)
+        ) {
+          Some(trackedEviction.longValue())
+        } else {
+          nextProcessingEvictionTimestamp(currentProcessingTime)
+        }
+      retryVersion.foreach { version =>
+        // This normally shares the tracked eviction timer; registering the same keyed
+        // timestamp is idempotent and avoids a separate hot retry loop while fenced.
+        timerService.registerProcessingTimeTimer(version)
+        pendingVersionCollisionState.update(version)
+      }
+    }
+  }
+
   private def flushVersionCollision(
       timerService: TimerService,
       currentProcessingTime: Long,
+      currentTimerCallback: Option[(TimeDomain, Long)],
       currentKey: java.util.List[Any],
       out: Collector[TimestampedTile]
   ): Unit = {
@@ -300,15 +548,14 @@ class GigaTileProcessFunction(
       out.collect(new TimestampedTile(currentKey, encoded, pendingVersion.longValue(), System.currentTimeMillis()))
       lastEmittedVersionState.update(pendingVersion)
       pendingVersionCollisionState.clear()
+      pendingPublicationState.clear()
+      clearPublicationWakeupMarkers()
     } catch {
       case e: Exception =>
         // The fired timer was the only flush trigger. Re-arm before the outer handler records
         // the failure so a transient encoding/collection error cannot strand the latest value.
-        if (currentProcessingTime < Long.MaxValue) {
-          val retryVersion = currentProcessingTime + 1L
-          timerService.registerProcessingTimeTimer(retryVersion)
-          pendingVersionCollisionState.update(retryVersion)
-        }
+        scheduleProcessingEvictionTimerIfNeeded(timerService, currentProcessingTime)
+        postponeVersionCollision(timerService, currentProcessingTime, currentTimerCallback)
         throw e
     }
   }
@@ -332,20 +579,39 @@ class GigaTileProcessFunction(
       val timerService = ctx.timerService()
       val currentProcessingTime = timerService.currentProcessingTime()
       repairExpiredProcessingTimerMarkers(timerService, currentProcessingTime, None)
-      val rolloverResult = processor.advanceWatermark(currentProcessingTime)
+      if (isFutureEvent(tsMills, currentProcessingTime)) {
+        futureEventDropCounter.inc()
+        return
+      }
+      clearExpiredPublicationRetryMarker(currentProcessingTime, None)
+      val eventTimeWatermark = timerService.currentWatermark()
+      val mode = currentClockMode(currentProcessingTime, eventTimeWatermark)
+      val horizons = ChrononClockMode.streamEventHorizons(mode,
+                                                          tsMills,
+                                                          currentProcessingTime,
+                                                          eventTimeWatermark,
+                                                          processor.minSmallWindowTileSize)
+
+      val rolloverResult =
+        if (mode == NoWatermark) processor.advanceDayAsOf(tsMills)
+        else advanceDayForMode(mode, currentProcessingTime, eventTimeWatermark)
+      val pendingRebuild = rebuildPendingAtCurrentTime(mode, horizons, currentProcessingTime)
       val eventResult = processor.onEvent(row,
                                           tsMills,
-                                          largeWindowAsOfTs = currentProcessingTime,
-                                          smallWindowAsOfTs = adjustedSmallWindowAsOfTs(currentProcessingTime))
-      val result = if (eventResult.finalizedVector != null) eventResult else rolloverResult
+                                          largeWindowAsOfTs = horizons.largeWindowAsOfMillis,
+                                          smallWindowAsOfTs = horizons.smallWindowAsOfMillis)
+      val result = preferLatestResult(eventResult, pendingRebuild.getOrElse(rolloverResult))
 
       scheduleProcessingEvictionTimerIfNeeded(timerService, currentProcessingTime)
-      emitOrCoalesceVersionCollision(timerService,
-                                     result.finalizedVector,
-                                     ctx.getCurrentKey,
-                                     currentProcessingTime,
-                                     event.startProcessingTimeMillis,
-                                     out)
+      emitOrDefer(mode,
+                  horizons,
+                  result,
+                  ctx.getCurrentKey,
+                  currentProcessingTime,
+                  event.startProcessingTimeMillis,
+                  timerService,
+                  out,
+                  scheduleWatermarkRetry = true)
 
     } catch {
       case e: Exception =>
@@ -367,26 +633,40 @@ class GigaTileProcessFunction(
       val timerService = ctx.timerService()
       val currentProcessingTime = timerService.currentProcessingTime()
       repairExpiredProcessingTimerMarkers(timerService, currentProcessingTime, None)
-      val rolloverResult = processor.advanceWatermark(currentProcessingTime)
+      clearExpiredPublicationRetryMarker(currentProcessingTime, None)
+      val eventTimeWatermark = timerService.currentWatermark()
+      val mode = currentClockMode(currentProcessingTime, eventTimeWatermark)
+      val horizons = ChrononClockMode.batchUpdateHorizons(mode,
+                                                          batchRow.batchEndTs,
+                                                          flinkStore.getCurrentDayStart,
+                                                          currentProcessingTime,
+                                                          eventTimeWatermark,
+                                                          processor.minSmallWindowTileSize)
 
+      val rolloverResult = advanceDayForMode(mode, currentProcessingTime, eventTimeWatermark)
+      val pendingRebuild = rebuildPendingAtCurrentTime(mode, horizons, currentProcessingTime)
       val batchIr = gigaTileCodec.decodeBatchIr(batchRow.valueBytes)
       val batchResult = processor.onBatchUpdate(batchIr,
                                                 batchRow.batchEndTs,
-                                                largeWindowAsOfTs = currentProcessingTime,
-                                                smallWindowAsOfTs = adjustedSmallWindowAsOfTs(currentProcessingTime))
-      val result = if (batchResult.finalizedVector != null) batchResult else rolloverResult
+                                                largeWindowAsOfTs = horizons.largeWindowAsOfMillis,
+                                                smallWindowAsOfTs = horizons.smallWindowAsOfMillis)
+      val result = preferLatestResult(batchResult, pendingRebuild.getOrElse(rolloverResult))
 
       batchUpdateCounter.inc()
 
-      if (batchResult.needsEvictionTimer) {
+      emitOrDefer(mode,
+                  horizons,
+                  result,
+                  ctx.getCurrentKey,
+                  currentProcessingTime,
+                  System.currentTimeMillis(),
+                  timerService,
+                  out,
+                  scheduleWatermarkRetry = true)
+
+      if (batchResult.needsEvictionTimer || hasPendingPublication) {
         scheduleProcessingEvictionTimerIfNeeded(timerService, currentProcessingTime)
       }
-      emitOrCoalesceVersionCollision(timerService,
-                                     result.finalizedVector,
-                                     ctx.getCurrentKey,
-                                     currentProcessingTime,
-                                     System.currentTimeMillis(),
-                                     out)
     } catch {
       case e: Exception =>
         logger.error(s"Error processing batch IR for groupBy=${groupBy.getMetaData.getName}", e)
@@ -403,21 +683,63 @@ class GigaTileProcessFunction(
     var processingTimeOnFailure = Long.MinValue
     var evictionTimerFired = false
     var versionCollisionTimerFired = false
+    var publicationRetryTimerFired = false
+    var publicationActivationTimerFired = false
+    var expiredPublicationRetryMarkerCleared = false
     try {
       if (processor == null) initializeTransients()
 
       ensureStateBound(ctx.getCurrentKey)
       val timerService = ctx.timerService()
       val currentProcessingTime = timerService.currentProcessingTime()
+      val currentTimerCallback = Some(ctx.timeDomain() -> timestamp)
       timerServiceOnFailure = timerService
       processingTimeOnFailure = currentProcessingTime
-      repairExpiredProcessingTimerMarkers(timerService, currentProcessingTime, Some(ctx.timeDomain() -> timestamp))
+      repairExpiredProcessingTimerMarkers(timerService, currentProcessingTime, currentTimerCallback)
 
-      // Checkpoints written by the event-time implementation may still contain several
-      // event-time eviction timers per key. Let those callbacks migrate the key to one
-      // processing-time timer, but do not publish from both timer domains.
+      // Checkpoints written by the former event-time implementation may still contain
+      // eviction timers. Only the explicitly tracked activation timer may publish from this
+      // domain; untracked legacy timers remain migration-only.
       if (ctx.timeDomain() == TimeDomain.EVENT_TIME) {
+        val isPublicationActivationTimer = isCurrentPublicationActivationTimer(timestamp)
+        publicationActivationTimerFired = isPublicationActivationTimer
+        if (isPublicationActivationTimer) pendingPublicationActivationTimerState.clear()
         scheduleProcessingEvictionTimerIfNeeded(timerService, currentProcessingTime)
+        if (isPublicationActivationTimer) {
+          if (hasPendingPublication) {
+            val eventTimeWatermark = timerService.currentWatermark()
+            currentClockMode(currentProcessingTime, eventTimeWatermark) match {
+              case Live =>
+                val horizons = ChrononClockMode
+                  .processingTimerHorizons(Live,
+                                           currentProcessingTime,
+                                           eventTimeWatermark,
+                                           processor.minSmallWindowTileSize)
+                  .get
+                val rolloverResult = advanceDayForMode(Live, currentProcessingTime, eventTimeWatermark)
+                val retryResult = rebuildPendingAtCurrentTime(Live, horizons, currentProcessingTime)
+                  .getOrElse(GigaEmitResult(null))
+                val result = preferLatestResult(retryResult, rolloverResult)
+                emitOrDefer(Live,
+                            horizons,
+                            result,
+                            ctx.getCurrentKey,
+                            currentProcessingTime,
+                            System.currentTimeMillis(),
+                            timerService,
+                            out,
+                            scheduleWatermarkRetry = false)
+              case Catchup =>
+                // If callback delivery consumed the Live slack, separate retries from source
+                // watermark cadence before installing a new activation boundary.
+                schedulePublicationRetryAfterIfNeeded(timerService,
+                                                      currentProcessingTime,
+                                                      activationCooldownDelayMillis)
+              case mode =>
+                scheduleFencedPublicationWakeupIfNeeded(timerService, currentProcessingTime, eventTimeWatermark, mode)
+            }
+          }
+        }
         return
       }
 
@@ -427,37 +749,101 @@ class GigaTileProcessFunction(
 
       val isEvictionTimer = isCurrentProcessingEvictionTimer(timestamp)
       val isVersionCollisionTimer = isCurrentVersionCollisionTimer(timestamp)
+      val isPublicationRetryTimer = isCurrentPublicationRetryTimer(timestamp)
       evictionTimerFired = isEvictionTimer
       versionCollisionTimerFired = isVersionCollisionTimer
-      if (!isEvictionTimer && !isVersionCollisionTimer) return
+      publicationRetryTimerFired = isPublicationRetryTimer
+      if (!isPublicationRetryTimer) {
+        expiredPublicationRetryMarkerCleared =
+          clearExpiredPublicationRetryMarker(currentProcessingTime, currentTimerCallback)
+      }
+      if (
+        !isEvictionTimer && !isVersionCollisionTimer && !isPublicationRetryTimer &&
+        !expiredPublicationRetryMarkerCleared
+      ) return
 
-      var finalizedVector: Array[Any] = null
+      // The physical retry timer has fired. Clear only its logical role before running all
+      // coincident roles, then arm one watermark-driven wake-up if publication remains fenced.
+      if (isPublicationRetryTimer) clearPublicationRetryMarker()
+      val eventTimeWatermark = timerService.currentWatermark()
+      val mode = currentClockMode(currentProcessingTime, eventTimeWatermark)
+      val timerHorizons = ChrononClockMode.processingTimerHorizons(mode,
+                                                                   currentProcessingTime,
+                                                                   eventTimeWatermark,
+                                                                   processor.minSmallWindowTileSize)
+
+      var result = GigaEmitResult(null)
       if (isEvictionTimer) {
         nextProcessingEvictionTimerState.clear()
-        val rolloverResult = processor.advanceWatermark(currentProcessingTime)
-        val evictionResult = processor.onEviction(
-          EvictionTimes(timerTs = currentProcessingTime,
-                        smallWindowAsOfTs = adjustedSmallWindowAsOfTs(currentProcessingTime)))
-        finalizedVector =
-          if (evictionResult.finalizedVector != null) evictionResult.finalizedVector else rolloverResult.finalizedVector
+        mode match {
+          case NoWatermark =>
+            // The active batch input holds the connected watermark at MIN while it scans.
+            // Keep consuming records, but do not age or roll keyed state from wall clock.
+            val snapshot = processor.currentSnapshot
+            if (!snapshot.isEmpty) pendingPublicationState.update(java.lang.Boolean.TRUE)
+            result = GigaEmitResult(null, needsEvictionTimer = snapshot.needsEvictionTimer, isEmpty = snapshot.isEmpty)
+          case _ =>
+            val horizons = timerHorizons.get
+            val rolloverResult = advanceDayForMode(mode, currentProcessingTime, eventTimeWatermark)
+            val evictionResult = rebuildPendingAtCurrentTime(mode, horizons, currentProcessingTime)
+              .getOrElse(
+                processor.onEviction(EvictionTimes(timerTs = horizons.largeWindowAsOfMillis,
+                                                   smallWindowAsOfTs = horizons.smallWindowAsOfMillis)))
+            result = preferLatestResult(evictionResult, rolloverResult)
+        }
 
-        // Re-register before a coincident collision flush: if encoding the flush fails, both
-        // the retry and normal eviction cadence remain live.
-        if (!evictionResult.isEmpty || evictionResult.needsEvictionTimer) {
+        // Keep normal decay live while state or a deferred publication remains. A coincident
+        // collision flush rearms itself on failure, so it does not need a speculative timer.
+        if (!result.isEmpty || result.needsEvictionTimer || hasPendingPublication) {
           scheduleProcessingEvictionTimerIfNeeded(timerService, currentProcessingTime)
+        }
+
+        timerHorizons.foreach { horizons =>
+          emitOrDefer(mode,
+                      horizons,
+                      result,
+                      ctx.getCurrentKey,
+                      currentProcessingTime,
+                      System.currentTimeMillis(),
+                      timerService,
+                      out,
+                      scheduleWatermarkRetry = false)
+        }
+      }
+
+      if (isPublicationRetryTimer && !isEvictionTimer && hasPendingPublication) {
+        timerHorizons.foreach { horizons =>
+          val retryResult = rebuildPendingAtCurrentTime(mode, horizons, currentProcessingTime)
+            .getOrElse(GigaEmitResult(null))
+          emitOrDefer(mode,
+                      horizons,
+                      retryResult,
+                      ctx.getCurrentKey,
+                      currentProcessingTime,
+                      System.currentTimeMillis(),
+                      timerService,
+                      out,
+                      scheduleWatermarkRetry = false)
         }
       }
 
       if (isVersionCollisionTimer) {
-        // Eviction wins when both timers share a timestamp; publish one post-eviction snapshot.
-        flushVersionCollision(timerService, currentProcessingTime, ctx.getCurrentKey, out)
-      } else {
-        emitOrCoalesceVersionCollision(timerService,
-                                       finalizedVector,
-                                       ctx.getCurrentKey,
-                                       currentProcessingTime,
-                                       System.currentTimeMillis(),
-                                       out)
+        timerHorizons match {
+          case Some(horizons) if shouldPublish(mode, horizons, currentProcessingTime) =>
+            // Eviction runs first when both markers share a timestamp, so this is one
+            // post-eviction snapshot with a strictly newer version.
+            pendingPublicationState.update(java.lang.Boolean.TRUE)
+            flushVersionCollision(timerService, currentProcessingTime, currentTimerCallback, ctx.getCurrentKey, out)
+          case _ =>
+            pendingPublicationState.update(java.lang.Boolean.TRUE)
+            scheduleProcessingEvictionTimerIfNeeded(timerService, currentProcessingTime)
+            postponeVersionCollision(timerService, currentProcessingTime, currentTimerCallback)
+        }
+      }
+
+      if ((isPublicationRetryTimer || expiredPublicationRetryMarkerCleared) && hasPendingPublication) {
+        scheduleProcessingEvictionTimerIfNeeded(timerService, currentProcessingTime)
+        scheduleFencedPublicationWakeupIfNeeded(timerService, currentProcessingTime, eventTimeWatermark, mode)
       }
     } catch {
       case e: Exception =>
@@ -489,6 +875,22 @@ class GigaTileProcessFunction(
               }
             timerServiceOnFailure.registerProcessingTimeTimer(retryVersion)
             pendingVersionCollisionState.update(retryVersion)
+          }
+          if ((publicationRetryTimerFired || expiredPublicationRetryMarkerCleared) && hasPendingPublication) {
+            val eventTimeWatermark = timerServiceOnFailure.currentWatermark()
+            currentClockMode(processingTimeOnFailure, eventTimeWatermark) match {
+              case Live => schedulePublicationRetryIfNeeded(timerServiceOnFailure, processingTimeOnFailure)
+              case mode =>
+                scheduleFencedPublicationWakeupIfNeeded(timerServiceOnFailure,
+                                                        processingTimeOnFailure,
+                                                        eventTimeWatermark,
+                                                        mode)
+            }
+          }
+          if (publicationActivationTimerFired && hasPendingPublication) {
+            schedulePublicationRetryAfterIfNeeded(timerServiceOnFailure,
+                                                  processingTimeOnFailure,
+                                                  activationCooldownDelayMillis)
           }
         }
         logger.error(s"Error in giga tile eviction for groupBy=${groupBy.getMetaData.getName}", e)
@@ -523,7 +925,7 @@ class GigaTileProcessFunction(
 
 /** TileStore backed by Flink state for GigaTile. Extends the mega tile state with batch IR
   * storage and a per-day large-IR map (keyed by day-start) sized to bridge any retained gap
-  * between batchEndDay and the watermark day.
+  * between batchEndDay and the current materialized day.
   */
 class FlinkGigaTileStore(megaTileAgg: MegaTileAggregator, codec: MegaTileCodec, gigaCodec: GigaTileCodec)
     extends GigaTileStore {

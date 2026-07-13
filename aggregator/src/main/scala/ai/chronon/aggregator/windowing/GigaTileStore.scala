@@ -25,7 +25,7 @@ trait GigaTileStore extends TileStore {
   def putLastLargeRecomputeAsOfTs(ts: Long): Unit
 
   // Per-day large-window IR state. One slot per day with streaming events between
-  // batchEndDay and the current watermark day; pruned on batch advance.
+  // batchEndDay and the current materialized day; pruned on batch advance.
   def getDailyLargeIr(dayStart: Long): Array[Any]
   def putDailyLargeIr(dayStart: Long, ir: Array[Any]): Unit
   def removeDailyLargeIr(dayStart: Long): Unit

@@ -10,7 +10,7 @@ private[chronon] final case class EvictionTimes(timerTs: Long, smallWindowAsOfTs
 /** Pure Scala state manager for the GigaTile streaming pipeline.
   *
   * Flink holds the FinalBatchIr in state (loaded from Iceberg) and one daily large-window
-  * IR slot per day with streaming events between batchEndDay and the watermark day. The
+  * IR slot per day with streaming events between batchEndDay and the current materialized day. The
   * runningLargeIr cache is the merged batch + every retained daily slot, refreshed on
   * eviction and on batch update.
   *
@@ -225,20 +225,20 @@ class GigaTileStreamProcessor(
   /** As-of-driven day transition. Finite day jumps rebuild both views so the next callback
     * cannot combine a corrected small-window cache with stale large-window state.
     */
-  def advanceWatermark(watermarkTs: Long): GigaEmitResult = {
+  def advanceDayAsOf(asOfTs: Long): GigaEmitResult = {
     val currentDayStart = store.getCurrentDayStart
     if (currentDayStart == -1L) return GigaEmitResult(null)
-    val wmDay = TsUtils.round(watermarkTs, DayMillis)
-    if (wmDay > currentDayStart) {
+    val asOfDay = TsUtils.round(asOfTs, DayMillis)
+    if (asOfDay > currentDayStart) {
       val previousPackedIr = windowedAgg.clone(pack())
-      store.putCurrentDayStart(wmDay)
-      // A terminal MAX watermark is not a serving horizon. Rebuilding at MAX would expire
-      // every retained value and publish a synthetic all-null row when a bounded input ends.
-      if (watermarkTs != Long.MaxValue) {
-        rebuildCachedSmallWindowIr(watermarkTs, wmDay)
+      store.putCurrentDayStart(asOfDay)
+      // A terminal Long.MaxValue horizon from a bounded watermark is not a serving horizon.
+      // Rebuilding there would expire every retained value and publish a synthetic all-null row.
+      if (asOfTs != Long.MaxValue) {
+        rebuildCachedSmallWindowIr(asOfTs, asOfDay)
         // A future batch row is retained but must not become active until its boundary.
         // Small-window time can still advance while the prior large view remains serving.
-        if (!largeRecomputeDeferred(wmDay)) recomputeRunningLargeIr(watermarkTs, wmDay)
+        if (!largeRecomputeDeferred(asOfDay)) recomputeRunningLargeIr(asOfTs, asOfDay)
         val packed = pack()
         val packedIsEmpty = isAllNull(packed)
         val previousWasEmpty = isAllNull(previousPackedIr)
@@ -249,6 +249,9 @@ class GigaTileStreamProcessor(
     }
     GigaEmitResult(null, isEmpty = isAllNull(pack()))
   }
+
+  // Compatibility wrapper for callers that still pass an event-time watermark directly.
+  def advanceWatermark(watermarkTs: Long): GigaEmitResult = advanceDayAsOf(watermarkTs)
 
   /** Direct eviction/serve-as-of: corrects small window sawtooth and large window tail selection. */
   def onEviction(timerTs: Long): GigaEmitResult =
@@ -380,9 +383,9 @@ class GigaTileStreamProcessor(
         currentDayStart = newBatchEnd
         store.putCurrentDayStart(currentDayStart)
       } else {
-        // Defer until watermark advances past batchEnd. Daily slots between currentDayStart
-        // and batchEnd would otherwise overlap with batch and double-count. Event, timer, and
-        // day-roll recomputation paths all honor largeRecomputeDeferred.
+        // Defer until the selected large-window as-of day reaches batchEnd. Daily slots between
+        // currentDayStart and batchEnd would otherwise overlap with batch and double-count. Event,
+        // timer, and day-roll recomputation paths all honor largeRecomputeDeferred.
         return GigaEmitResult(null, needsEvictionTimer = true)
       }
     }
@@ -494,7 +497,7 @@ class GigaTileStreamProcessor(
       // Slot entirely outside the largest window — useful to no column. Drop from state.
       if (dayStart < batchEndDay) {
         toEvict += dayStart
-      } else if (maxWindowMillis > 0 && slotEnd <= queryTs - maxWindowMillis) {
+      } else if (maxWindowMillis > 0 && maxWindowMillis < Long.MaxValue && slotEnd <= queryTs - maxWindowMillis) {
         toEvict += dayStart
       } else if (dayStart >= batchEndDay && dayIr != null) {
         var col = 0
@@ -606,7 +609,9 @@ class GigaTileStreamProcessor(
   /** Snapshot the current value without moving either aggregation clock. */
   private[chronon] def currentSnapshot: GigaEmitResult = {
     val packed = pack()
-    GigaEmitResult(windowedAgg.finalize(packed), isEmpty = isAllNull(packed))
+    GigaEmitResult(windowedAgg.finalize(packed),
+                   needsEvictionTimer = largeRecomputeDeferred(store.getCurrentDayStart),
+                   isEmpty = isAllNull(packed))
   }
 
   /** Strip tail hops that are only used by small windows to reduce state size.

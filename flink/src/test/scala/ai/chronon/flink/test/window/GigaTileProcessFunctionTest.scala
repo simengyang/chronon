@@ -10,6 +10,7 @@ import ai.chronon.aggregator.windowing.{
 }
 import ai.chronon.api._
 import ai.chronon.api.Extensions.WindowOps
+import ai.chronon.flink.FlinkJob
 import ai.chronon.flink.deser.ProjectedEvent
 import ai.chronon.flink.types.{BatchIrRow, TimestampedTile}
 import ai.chronon.flink.window.GigaTileProcessFunction
@@ -23,6 +24,7 @@ import org.apache.flink.runtime.state.KeyedStateBackend
 import org.apache.flink.streaming.api.functions.co.KeyedCoProcessFunction
 import org.apache.flink.streaming.api.operators.co.KeyedCoProcessOperator
 import org.apache.flink.streaming.api.watermark.Watermark
+import org.apache.flink.streaming.runtime.watermarkstatus.WatermarkStatus
 import org.apache.flink.streaming.util.KeyedTwoInputStreamOperatorTestHarness
 import org.apache.flink.util.Collector
 import org.scalatest.flatspec.AnyFlatSpec
@@ -42,6 +44,7 @@ class GigaTileProcessFunctionTest extends AnyFlatSpec with Matchers {
     try {
       testHarness.open()
       testHarness.setProcessingTime(processingTs)
+      advanceToHealthyLiveWatermark(testHarness, processingTs)
       testHarness.processElement1(
         ProjectedEvent(Map(Constants.TimeColumn -> retainedLateEventTs, "num" -> 5L), carriedProcessingTs),
         retainedLateEventTs)
@@ -64,7 +67,9 @@ class GigaTileProcessFunctionTest extends AnyFlatSpec with Matchers {
     try {
       testHarness.open()
       testHarness.setProcessingTime(justBeforeExpiry)
+      advanceToHealthyLiveWatermark(testHarness, justBeforeExpiry)
       testHarness.processElement1(event(eventTs, 5L), eventTs)
+      advanceToHealthyLiveWatermark(testHarness, afterExpiry)
       testHarness.setProcessingTime(afterExpiry)
 
       val outputs = testHarness.extractOutputValues()
@@ -86,7 +91,9 @@ class GigaTileProcessFunctionTest extends AnyFlatSpec with Matchers {
     try {
       testHarness.open()
       testHarness.setProcessingTime(beforeMidnightProcessingTs)
+      advanceToHealthyLiveWatermark(testHarness, beforeMidnightProcessingTs)
       testHarness.processElement1(event(initialEventTs, 5L), initialEventTs)
+      advanceToHealthyLiveWatermark(testHarness, afterMidnightProcessingTs)
       testHarness.setProcessingTime(afterMidnightProcessingTs)
       // Zipline suppresses redundant timer writes. Crossing midnight must still leave the
       // retained pre-midnight value available to the next event.
@@ -118,6 +125,7 @@ class GigaTileProcessFunctionTest extends AnyFlatSpec with Matchers {
     try {
       testHarness.open()
       testHarness.setProcessingTime(processingTs)
+      advanceToHealthyLiveWatermark(testHarness, processingTs)
       testHarness.processElement2(
         new BatchIrRow(entityKey(), batchCodec.encodeBatchIr(finalBatchIr), batchEndTs),
         batchEndTs)
@@ -142,6 +150,7 @@ class GigaTileProcessFunctionTest extends AnyFlatSpec with Matchers {
     try {
       testHarness.open()
       testHarness.setProcessingTime(processingTs)
+      advanceToHealthyLiveWatermark(testHarness, processingTs)
       testHarness.processElement2(
         new BatchIrRow(entityKey(), batchCodec.encodeBatchIr(emptyBatchIr), batchEndTs),
         batchEndTs)
@@ -180,19 +189,105 @@ class GigaTileProcessFunctionTest extends AnyFlatSpec with Matchers {
       testHarness.processElement2(futureBatchRow, futureBatchEnd)
 
       testHarness.extractOutputValues().asScala shouldBe empty
-      testHarness.numProcessingTimeTimers() shouldEqual 1
+      // A short watermark retry and the normal eviction timer are both live initially.
+      testHarness.numProcessingTimeTimers() shouldEqual 2
 
       testHarness.setProcessingTime(currentProcessingTs + hourMillis)
 
       testHarness.extractOutputValues().asScala shouldBe empty
       testHarness.numProcessingTimeTimers() shouldEqual 1
 
+      advanceToHealthyLiveWatermark(testHarness, futureBatchEnd + hourMillis)
       testHarness.setProcessingTime(futureBatchEnd + hourMillis)
 
       val outputs = testHarness.extractOutputValues()
       outputs.size() shouldEqual 1
       decodeSum(outputs.get(0), batchGroupBy) shouldEqual 50L
       outputs.get(0).latestTsMillis shouldEqual futureBatchEnd + hourMillis
+    } finally testHarness.close()
+  }
+
+  it should "drop a future event before it can poison batch-backed large-window state" in {
+    val dayMillis = new Window(1, TimeUnit.DAYS).millis
+    val batchGroupBy = Builders.GroupBy(
+      metaData = Builders.MetaData(name = "gigatile-process-function-future-event-test"),
+      aggregations = Seq(Builders.Aggregation(Operation.SUM, "num", Seq(new Window(7, TimeUnit.DAYS)))))
+    val testHarness = harness(new GigaTileProcessFunction(batchGroupBy, inputSchema))
+    val currentProcessingTime = 10 * dayMillis + new Window(1, TimeUnit.HOURS).millis
+    val batchCallbackTime = currentProcessingTime - 2L
+    val batchEnd = 9 * dayMillis
+
+    try {
+      testHarness.open()
+      testHarness.setProcessingTime(batchCallbackTime)
+      advanceToHealthyLiveWatermark(testHarness, batchCallbackTime)
+      testHarness.processElement2(batchRow(batchGroupBy, batchEnd, batchEnd - 1000L, 3L), batchEnd)
+      decodeSum(testHarness.extractOutputValues().get(0), batchGroupBy) shouldEqual 3L
+
+      testHarness.setProcessingTime(currentProcessingTime)
+      advanceToHealthyLiveWatermark(testHarness, currentProcessingTime)
+      testHarness.processElement1(event(currentProcessingTime + 1L, 11L), currentProcessingTime + 1L)
+      testHarness.processElement1(event(currentProcessingTime - 1000L, 5L), currentProcessingTime - 1000L)
+
+      val outputs = testHarness.extractOutputValues()
+      outputs.size() shouldEqual 2
+      decodeSum(outputs.get(1), batchGroupBy) shouldEqual 8L
+      outputs.get(1).latestTsMillis shouldEqual currentProcessingTime
+    } finally testHarness.close()
+  }
+
+  it should "stay fenced while a source watermark implies a future event" in {
+    val testHarness = harness(new GigaTileProcessFunction(groupBy, inputSchema))
+    val futureEventTime = processingTs + 1L
+    val historicalEventTime = processingTs - 1000L
+    val poisonedWatermark = processingTs - FlinkJob.AllowedOutOfOrderness.toMillis
+    val retryTime = processingTs + 2L * FlinkJob.AutoWatermarkInterval
+
+    try {
+      testHarness.open()
+      testHarness.setProcessingTime(processingTs)
+      testHarness.processWatermarkStatus2(WatermarkStatus.IDLE)
+      testHarness.processElement1(event(futureEventTime, 11L), futureEventTime)
+      testHarness.processWatermark1(new Watermark(poisonedWatermark))
+      testHarness.processElement1(event(historicalEventTime, 5L), historicalEventTime)
+
+      testHarness.extractOutputValues() shouldBe empty
+      testHarness.setProcessingTime(retryTime)
+
+      val outputs = testHarness.extractOutputValues()
+      outputs should have size 1
+      decodeSum(outputs.get(0)) shouldEqual 5L
+      outputs.get(0).latestTsMillis shouldEqual retryTime
+    } finally testHarness.close()
+  }
+
+  it should "wait once at the exact safe boundary for a finite future watermark" in {
+    val function = new GigaTileProcessFunction(groupBy, inputSchema)
+    val testHarness = harness(function)
+    val futureWatermark = processingTs + 1000L
+    val shortRetryTime = processingTs + 2L * FlinkJob.AutoWatermarkInterval
+    val safeProcessingTime = futureWatermark + FlinkJob.AllowedOutOfOrderness.toMillis + 1L
+    val eventTime = processingTs - 1000L
+
+    try {
+      testHarness.open()
+      testHarness.setProcessingTime(processingTs)
+      advanceToLiveWatermark(testHarness, futureWatermark)
+      testHarness.processElement1(event(eventTime, 5L), eventTime)
+
+      testHarness.extractOutputValues() shouldBe empty
+      testHarness.setProcessingTime(shortRetryTime)
+      publicationRetryTimestamp(function) shouldEqual safeProcessingTime
+
+      testHarness.setProcessingTime(shortRetryTime + FlinkJob.IdlenessTimeout.toMillis)
+      testHarness.extractOutputValues() shouldBe empty
+      publicationRetryTimestamp(function) shouldEqual safeProcessingTime
+
+      testHarness.setProcessingTime(safeProcessingTime)
+      val outputs = testHarness.extractOutputValues()
+      outputs should have size 1
+      decodeSum(outputs.get(0)) shouldEqual 5L
+      outputs.get(0).latestTsMillis shouldEqual safeProcessingTime
     } finally testHarness.close()
   }
 
@@ -221,11 +316,567 @@ class GigaTileProcessFunctionTest extends AnyFlatSpec with Matchers {
     } finally restoredHarness.close()
   }
 
-  it should "restore and flush same-millisecond updates with a strictly newer version" in {
+  it should "advance only by event time while the batch input holds the watermark at MIN" in {
+    val dayMillis = new Window(1, TimeUnit.DAYS).millis
+    val currentProcessingTime = 10 * dayMillis + new Window(1, TimeUnit.HOURS).millis
+    val firstEventTime = dayMillis + new Window(1, TimeUnit.HOURS).millis
+    val laterEventTime = 4 * dayMillis + new Window(1, TimeUnit.HOURS).millis
+    val firstFutureEventTime = currentProcessingTime + 1L
+    val farFutureEventTime = currentProcessingTime + 2 * dayMillis
+    val function = new GigaTileProcessFunction(groupBy, inputSchema)
+    val testHarness = harness(function)
+
+    try {
+      testHarness.open()
+      testHarness.setProcessingTime(currentProcessingTime)
+      // Input 2 remains active, so this input-1 watermark does not initialize the connected one.
+      testHarness.processWatermark1(new Watermark(currentProcessingTime))
+      testHarness.processElement1(event(firstEventTime, 5L), firstEventTime)
+      testHarness.processElement1(event(laterEventTime, 7L), laterEventTime)
+
+      testHarness.extractOutputValues() shouldBe empty
+      currentFinalizedSum(function) shouldEqual 7L
+      currentDayStart(function) shouldEqual 4 * dayMillis
+
+      // Any future event is rejected before it can mutate either small- or large-window state.
+      testHarness.processElement1(event(firstFutureEventTime, 11L), firstFutureEventTime)
+      testHarness.processElement1(event(farFutureEventTime, 11L), farFutureEventTime)
+      currentFinalizedSum(function) shouldEqual 7L
+      testHarness.setProcessingTime(nextEvictionHop(currentProcessingTime))
+      testHarness.extractOutputValues() shouldBe empty
+      currentDayStart(function) shouldEqual 4 * dayMillis
+      testHarness.numProcessingTimeTimers() shouldEqual 1
+    } finally testHarness.close()
+  }
+
+  it should "remain fail-closed when both inputs idle before any finite watermark" in {
+    val batchGroupBy = Builders.GroupBy(
+      metaData = Builders.MetaData(name = "gigatile-process-function-idle-bootstrap-test"),
+      aggregations = Seq(Builders.Aggregation(Operation.SUM, "num", Seq(new Window(7, TimeUnit.DAYS)))))
+    val function = new GigaTileProcessFunction(batchGroupBy, inputSchema)
+    val testHarness = harness(function)
+    val batchEnd = TsUtils.round(eventTs, new Window(1, TimeUnit.DAYS).millis)
+
+    try {
+      testHarness.open()
+      testHarness.setProcessingTime(processingTs)
+      testHarness.processElement2(batchRow(batchGroupBy, batchEnd, eventTs - 1000L, 3L), batchEnd)
+      testHarness.processWatermarkStatus1(WatermarkStatus.IDLE)
+      testHarness.processWatermarkStatus2(WatermarkStatus.IDLE)
+      testHarness.setProcessingTime(nextEvictionHop(processingTs))
+
+      // Marking both inputs idle does not synthesize a finite watermark. Without a previously
+      // observed finite event watermark, retain state rather than publish a partial row.
+      testHarness.extractOutputValues() shouldBe empty
+      testHarness.numProcessingTimeTimers() shouldEqual 1
+    } finally testHarness.close()
+  }
+
+  it should "bound finite batch-backed state during a long replay with an uninitialized watermark" in {
+    val dayMillis = new Window(1, TimeUnit.DAYS).millis
+    val replayGroupBy = Builders.GroupBy(
+      metaData = Builders.MetaData(name = "gigatile-process-function-long-replay-test"),
+      aggregations = Seq(Builders.Aggregation(Operation.SUM, "num", Seq(new Window(7, TimeUnit.DAYS)))))
+    val function = new GigaTileProcessFunction(replayGroupBy, inputSchema)
+    val testHarness = harness(function)
+    // Keep the serving horizon day-aligned so the daily large-IR boundary is exact.
+    val currentProcessingTime = 41 * dayMillis
+
+    try {
+      testHarness.open()
+      testHarness.setProcessingTime(currentProcessingTime)
+      testHarness.processElement2(emptyBatchRow(replayGroupBy, dayMillis), dayMillis)
+      (1 to 40).foreach { day =>
+        val eventTime = day * dayMillis + new Window(1, TimeUnit.HOURS).millis
+        testHarness.processElement1(event(eventTime, 1L), eventTime)
+      }
+
+      testHarness.extractOutputValues() shouldBe empty
+      currentDayStart(function) shouldEqual 40 * dayMillis
+      dailyLargeSlotCount(function) should be <= 8
+
+      val liveTimer = nextEvictionHop(currentProcessingTime)
+      advanceToHealthyLiveWatermark(testHarness, liveTimer)
+      testHarness.setProcessingTime(liveTimer)
+      val outputs = testHarness.extractOutputValues()
+      outputs should not be empty
+      decodeSum(outputs.get(outputs.size() - 1), replayGroupBy) shouldEqual 7L
+    } finally testHarness.close()
+  }
+
+  it should "use source watermark readiness across five-minute, hourly, and daily aggregation hops" in {
+    val hourMillis = new Window(1, TimeUnit.HOURS).millis
+    val dayMillis = new Window(1, TimeUnit.DAYS).millis
+    val staleWatermark = processingTs - 30 * 60 * 1000L
+    val liveWatermark = processingTs - FlinkJob.LiveWatermarkLagToleranceMillis
+    val cases = Seq(
+      ("five-minute", new Window(1, TimeUnit.HOURS), 5 * 60 * 1000L, false),
+      ("hourly", new Window(7, TimeUnit.DAYS), hourMillis, true),
+      ("daily", new Window(30, TimeUnit.DAYS), dayMillis, true)
+    )
+
+    cases.foreach { case (name, window, expectedHopMillis, needsBatch) =>
+      val testGroupBy = Builders.GroupBy(metaData = Builders.MetaData(name = s"gigatile-source-readiness-$name-test"),
+                                         aggregations = Seq(Builders.Aggregation(Operation.SUM, "num", Seq(window))))
+      val function = new GigaTileProcessFunction(testGroupBy, inputSchema)
+      val testHarness = harness(function)
+
+      try {
+        testHarness.open()
+        testHarness.setProcessingTime(processingTs)
+        currentProcessor(function).minSmallWindowTileSize shouldEqual expectedHopMillis
+        if (needsBatch) {
+          testHarness.processElement2(batchRow(testGroupBy, 0L, -1000L, 3L), 0L)
+        }
+        advanceToLiveWatermark(testHarness, staleWatermark)
+        testHarness.processElement1(event(staleWatermark - 1000L, 5L), staleWatermark - 1000L)
+
+        withClue(s"$name aggregation hop: ") {
+          testHarness.extractOutputValues() shouldBe empty
+        }
+
+        testHarness.processWatermark1(new Watermark(liveWatermark))
+        testHarness.processElement1(event(liveWatermark, 7L), liveWatermark)
+
+        val outputs = testHarness.extractOutputValues()
+        withClue(s"$name aggregation hop: ") {
+          outputs should have size 1
+          decodeSum(outputs.get(0), testGroupBy) shouldEqual (if (needsBatch) 15L else 12L)
+        }
+      } finally testHarness.close()
+    }
+  }
+
+  it should "keep a sparse key fenced until the global watermark is live" in {
+    val testHarness = harness(new GigaTileProcessFunction(groupBy, inputSchema))
+    val staleWatermark = processingTs - 10 * 60 * 1000L
+    val secondTimer = nextEvictionHop(nextEvictionHop(processingTs))
+
+    try {
+      testHarness.open()
+      testHarness.setProcessingTime(processingTs)
+      advanceToLiveWatermark(testHarness, staleWatermark)
+      testHarness.processElement1(event(staleWatermark - 1000L, 5L), staleWatermark - 1000L)
+      testHarness.setProcessingTime(secondTimer)
+      testHarness.extractOutputValues() shouldBe empty
+      testHarness.numProcessingTimeTimers() shouldEqual 1
+
+      testHarness.processElement1(event(staleWatermark + 1000L, 7L), staleWatermark + 1000L)
+      testHarness.extractOutputValues() shouldBe empty
+
+      val liveTimer = nextEvictionHop(secondTimer)
+      testHarness.processWatermark1(new Watermark(healthyLiveWatermark(liveTimer)))
+      testHarness.setProcessingTime(liveTimer)
+      val outputs = testHarness.extractOutputValues()
+      outputs.size() shouldEqual 1
+      decodeSum(outputs.get(0)) shouldEqual 12L
+      outputs.get(0).latestTsMillis shouldEqual liveTimer
+    } finally testHarness.close()
+  }
+
+  it should "publish a lone event after its periodic watermark catches up" in {
+    val testHarness = harness(new GigaTileProcessFunction(groupBy, inputSchema))
+    val eventTime = processingTs - 1000L
+    val retryTime = processingTs + 2L * FlinkJob.AutoWatermarkInterval
+
+    try {
+      testHarness.open()
+      testHarness.setProcessingTime(processingTs)
+      testHarness.processWatermarkStatus2(WatermarkStatus.IDLE)
+      testHarness.processElement1(event(eventTime, 5L), eventTime)
+
+      testHarness.extractOutputValues() shouldBe empty
+      testHarness.numProcessingTimeTimers() shouldEqual 2
+
+      testHarness.setProcessingTime(retryTime)
+      testHarness.extractOutputValues() shouldBe empty
+      testHarness.numEventTimeTimers() shouldEqual 1
+
+      val periodicWatermark = healthyLiveWatermark(processingTs)
+      testHarness.processWatermark1(new Watermark(periodicWatermark))
+
+      val outputs = testHarness.extractOutputValues()
+      outputs.size() shouldEqual 1
+      decodeSum(outputs.get(0)) shouldEqual 5L
+      outputs.get(0).latestTsMillis shouldEqual retryTime
+      testHarness.numProcessingTimeTimers() shouldEqual 1
+    } finally testHarness.close()
+  }
+
+  it should "park a catch-up publication on one event-time activation without hot retries" in {
+    val testHarness = harness(new GigaTileProcessFunction(groupBy, inputSchema))
+    val staleWatermark = processingTs - new Window(1, TimeUnit.HOURS).millis
+    val retryTime = processingTs + 2L * FlinkJob.AutoWatermarkInterval
+
+    try {
+      testHarness.open()
+      testHarness.setProcessingTime(processingTs)
+      advanceToLiveWatermark(testHarness, staleWatermark)
+      testHarness.processElement1(event(staleWatermark - 1000L, 5L), staleWatermark - 1000L)
+
+      testHarness.numProcessingTimeTimers() shouldEqual 2
+      testHarness.setProcessingTime(retryTime)
+
+      testHarness.extractOutputValues() shouldBe empty
+      testHarness.numProcessingTimeTimers() shouldEqual 1
+      testHarness.numEventTimeTimers() shouldEqual 1
+      testHarness.processElement1(event(staleWatermark + 1000L, 7L), staleWatermark + 1000L)
+      testHarness.setProcessingTime(retryTime + 5L * FlinkJob.AutoWatermarkInterval)
+      testHarness.extractOutputValues() shouldBe empty
+      testHarness.numProcessingTimeTimers() shouldEqual 1
+      testHarness.numEventTimeTimers() shouldEqual 1
+    } finally testHarness.close()
+  }
+
+  it should "publish a daily sparse key after watermark-only activation" in {
+    val dayMillis = new Window(1, TimeUnit.DAYS).millis
+    val dailyGroupBy = Builders.GroupBy(
+      metaData = Builders.MetaData(name = "gigatile-daily-sparse-activation-test"),
+      aggregations = Seq(Builders.Aggregation(Operation.SUM, "num", Seq(new Window(30, TimeUnit.DAYS)))))
+    val function = new GigaTileProcessFunction(dailyGroupBy, inputSchema)
+    val testHarness = harness(function)
+    val staleWatermark = processingTs - new Window(1, TimeUnit.HOURS).millis
+    val retryDelay = 2L * FlinkJob.AutoWatermarkInterval
+    val retryTime = processingTs + retryDelay
+
+    try {
+      testHarness.open()
+      testHarness.setProcessingTime(processingTs)
+      testHarness.processElement2(batchRow(dailyGroupBy, 0L, -1000L, 3L), 0L)
+      advanceToLiveWatermark(testHarness, staleWatermark)
+      testHarness.processElement1(event(staleWatermark - 1000L, 5L), staleWatermark - 1000L)
+      currentProcessor(function).minEvictionInterval shouldEqual dayMillis
+
+      testHarness.setProcessingTime(retryTime)
+      testHarness.extractOutputValues() shouldBe empty
+      testHarness.numEventTimeTimers() shouldEqual 1
+
+      testHarness.processWatermark1(new Watermark(healthyLiveWatermark(retryTime)))
+
+      val outputs = testHarness.extractOutputValues()
+      outputs should have size 1
+      decodeSum(outputs.get(0), dailyGroupBy) shouldEqual 8L
+      outputs.get(0).latestTsMillis shouldEqual retryTime
+      retryTime should be < nextDay(processingTs)
+    } finally testHarness.close()
+  }
+
+  it should "advance a catch-up day before publishing a batch-ahead sparse key" in {
+    val dayMillis = new Window(1, TimeUnit.DAYS).millis
+    val dailyGroupBy = Builders.GroupBy(
+      metaData = Builders.MetaData(name = "gigatile-batch-ahead-activation-test"),
+      aggregations = Seq(Builders.Aggregation(Operation.SUM, "num", Seq(new Window(30, TimeUnit.DAYS)))))
+    val function = new GigaTileProcessFunction(dailyGroupBy, inputSchema)
+    val testHarness = harness(function)
+    val currentProcessingTime = 10L * dayMillis + new Window(1, TimeUnit.HOURS).millis
+    val staleWatermark = 8L * dayMillis + new Window(1, TimeUnit.HOURS).millis
+    val batchEnd = 9L * dayMillis
+    val retryTime = currentProcessingTime + 2L * FlinkJob.AutoWatermarkInterval
+
+    try {
+      testHarness.open()
+      testHarness.setProcessingTime(currentProcessingTime)
+      advanceToLiveWatermark(testHarness, staleWatermark)
+      testHarness.processElement1(event(staleWatermark - 1000L, 5L), staleWatermark - 1000L)
+      testHarness.processElement2(batchRow(dailyGroupBy, batchEnd, batchEnd - 1000L, 3L), batchEnd)
+
+      currentDayStart(function) should be < batchEnd
+      testHarness.extractOutputValues() shouldBe empty
+      testHarness.setProcessingTime(retryTime)
+      testHarness.numEventTimeTimers() shouldEqual 1
+
+      testHarness.processWatermark1(new Watermark(liveActivationWatermark(retryTime)))
+
+      val outputs = testHarness.extractOutputValues()
+      outputs should have size 1
+      decodeSum(outputs.get(0), dailyGroupBy) shouldEqual 3L
+      currentDayStart(function) should be >= batchEnd
+    } finally testHarness.close()
+  }
+
+  it should "publish at the exact lower Live watermark boundary" in {
+    val testHarness = harness(new GigaTileProcessFunction(groupBy, inputSchema))
+    val staleWatermark = processingTs - new Window(1, TimeUnit.HOURS).millis
+    val retryTime = processingTs + 2L * FlinkJob.AutoWatermarkInterval
+
+    try {
+      testHarness.open()
+      testHarness.setProcessingTime(processingTs)
+      advanceToLiveWatermark(testHarness, staleWatermark)
+      testHarness.processElement1(event(staleWatermark - 1000L, 5L), staleWatermark - 1000L)
+      testHarness.setProcessingTime(retryTime)
+
+      testHarness.processWatermark1(new Watermark(liveActivationWatermark(retryTime)))
+
+      val outputs = testHarness.extractOutputValues()
+      outputs should have size 1
+      decodeSum(outputs.get(0)) shouldEqual 5L
+      outputs.get(0).latestTsMillis shouldEqual retryTime
+    } finally testHarness.close()
+  }
+
+  it should "move activation forward when processing time consumes the live slack" in {
+    val testHarness = harness(new GigaTileProcessFunction(groupBy, inputSchema))
+    val staleWatermark = processingTs - new Window(1, TimeUnit.HOURS).millis
+    val retryDelay = 2L * FlinkJob.AutoWatermarkInterval
+    val retryTime = processingTs + retryDelay
+    val firstActivationWatermark = liveActivationWatermark(retryTime)
+    val delayedProcessingTime = retryTime + FlinkJob.CatchupWatermarkLagSlackMillis + 1L
+    val cooldownDelay = math.max(retryDelay, FlinkJob.CatchupWatermarkLagSlackMillis / 2L)
+    val cooldownTime = delayedProcessingTime + cooldownDelay
+
+    try {
+      testHarness.open()
+      testHarness.setProcessingTime(processingTs)
+      advanceToLiveWatermark(testHarness, staleWatermark)
+      testHarness.processElement1(event(staleWatermark - 1000L, 5L), staleWatermark - 1000L)
+      testHarness.setProcessingTime(retryTime)
+
+      testHarness.setProcessingTime(delayedProcessingTime)
+      testHarness.processWatermark1(new Watermark(firstActivationWatermark))
+      testHarness.extractOutputValues() shouldBe empty
+      testHarness.numEventTimeTimers() shouldEqual 0
+
+      testHarness.setProcessingTime(cooldownTime)
+      testHarness.extractOutputValues() shouldBe empty
+      testHarness.numEventTimeTimers() shouldEqual 1
+
+      testHarness.processWatermark1(new Watermark(healthyLiveWatermark(cooldownTime)))
+
+      val outputs = testHarness.extractOutputValues()
+      outputs should have size 1
+      decodeSum(outputs.get(0)) shouldEqual 5L
+    } finally testHarness.close()
+  }
+
+  it should "preserve an eviction timer that shares a cleared publication-retry timestamp" in {
+    val testHarness = harness(new GigaTileProcessFunction(groupBy, inputSchema))
+    val retryDelay = 2L * FlinkJob.AutoWatermarkInterval
+    val evictionTime = nextEvictionHop(processingTs)
+    val firstProcessingTime = evictionTime - retryDelay
+    val firstEventTime = firstProcessingTime - 1000L
+
+    try {
+      testHarness.open()
+      testHarness.setProcessingTime(firstProcessingTime)
+      testHarness.processWatermarkStatus2(WatermarkStatus.IDLE)
+      testHarness.processElement1(event(firstEventTime, 5L), firstEventTime)
+      // The retry and normal eviction markers share one physical Flink timer.
+      testHarness.numProcessingTimeTimers() shouldEqual 1
+
+      testHarness.setProcessingTime(evictionTime)
+      testHarness.extractOutputValues() shouldBe empty
+      // Both roles fired: normal eviction remains scheduled and publication waits on watermark.
+      testHarness.numProcessingTimeTimers() shouldEqual 1
+      testHarness.numEventTimeTimers() shouldEqual 1
+    } finally testHarness.close()
+  }
+
+  it should "preserve a pending publication retry while draining an earlier callback" in {
+    val eventTime = processingTs - 1000L
+    val injectedTimer = processingTs + 1L
+    val retryTime = processingTs + 2L * FlinkJob.AutoWatermarkInterval
+    injectedTimer should be < retryTime
+    val originalHarness = harness(new GigaTileProcessFunction(groupBy, inputSchema))
+
+    originalHarness.open()
+    originalHarness.setProcessingTime(processingTs)
+    originalHarness.processWatermarkStatus2(WatermarkStatus.IDLE)
+    originalHarness.processElement1(event(eventTime, 5L), eventTime)
+    val snapshot = originalHarness.snapshot(10L, processingTs)
+    originalHarness.close()
+
+    val injectorHarness = harness(new ProcessingTimerInjector(injectedTimer))
+    injectorHarness.setup()
+    injectorHarness.initializeState(snapshot)
+    injectorHarness.open()
+    injectorHarness.setProcessingTime(processingTs)
+    injectorHarness.processElement1(event(eventTime, 0L), eventTime)
+    val injectedSnapshot = injectorHarness.snapshot(11L, processingTs)
+    injectorHarness.close()
+
+    val restoredHarness = harness(new GigaTileProcessFunction(groupBy, inputSchema))
+    try {
+      restoredHarness.setup()
+      restoredHarness.initializeState(injectedSnapshot)
+      restoredHarness.open()
+      restoredHarness.setProcessingTime(processingTs)
+      // The injected callback runs first while Flink already reports retryTime. It must not
+      // clear the still-queued publication retry marker.
+      restoredHarness.numProcessingTimeTimers() shouldEqual 3
+      advanceToHealthyLiveWatermark(restoredHarness, retryTime)
+      restoredHarness.setProcessingTime(retryTime)
+
+      val outputs = restoredHarness.extractOutputValues()
+      outputs.size() shouldEqual 1
+      decodeSum(outputs.get(0)) shouldEqual 5L
+      outputs.get(0).latestTsMillis shouldEqual retryTime
+      restoredHarness.numProcessingTimeTimers() shouldEqual 1
+    } finally restoredHarness.close()
+  }
+
+  it should "restore a watermark activation without another element" in {
+    val staleWatermark = processingTs - new Window(10, TimeUnit.MINUTES).millis
+    val retryTime = processingTs + 2L * FlinkJob.AutoWatermarkInterval
+    val originalHarness = harness(new GigaTileProcessFunction(groupBy, inputSchema))
+
+    originalHarness.open()
+    originalHarness.setProcessingTime(processingTs)
+    advanceToLiveWatermark(originalHarness, staleWatermark)
+    originalHarness.processElement1(event(staleWatermark - 1000L, 5L), staleWatermark - 1000L)
+    originalHarness.setProcessingTime(retryTime)
+    originalHarness.extractOutputValues() shouldBe empty
+    originalHarness.numProcessingTimeTimers() shouldEqual 1
+    originalHarness.numEventTimeTimers() shouldEqual 1
+    val snapshot = originalHarness.snapshot(11L, retryTime)
+    originalHarness.close()
+
+    val restoredHarness = harness(new GigaTileProcessFunction(groupBy, inputSchema))
+    try {
+      restoredHarness.setup()
+      restoredHarness.initializeState(snapshot)
+      restoredHarness.open()
+      restoredHarness.setProcessingTime(retryTime)
+      advanceToHealthyLiveWatermark(restoredHarness, retryTime)
+      val outputs = restoredHarness.extractOutputValues()
+      outputs.size() shouldEqual 1
+      decodeSum(outputs.get(0)) shouldEqual 5L
+      outputs.get(0).latestTsMillis shouldEqual retryTime
+    } finally restoredHarness.close()
+  }
+
+  it should "restore a delayed activation cooldown without another element" in {
+    val staleWatermark = processingTs - new Window(10, TimeUnit.MINUTES).millis
+    val retryDelay = 2L * FlinkJob.AutoWatermarkInterval
+    val retryTime = processingTs + retryDelay
+    val firstActivationWatermark = liveActivationWatermark(retryTime)
+    val delayedProcessingTime = retryTime + FlinkJob.CatchupWatermarkLagSlackMillis + 1L
+    val cooldownDelay = math.max(retryDelay, FlinkJob.CatchupWatermarkLagSlackMillis / 2L)
+    val cooldownTime = delayedProcessingTime + cooldownDelay
+    val originalHarness = harness(new GigaTileProcessFunction(groupBy, inputSchema))
+
+    originalHarness.open()
+    originalHarness.setProcessingTime(processingTs)
+    advanceToLiveWatermark(originalHarness, staleWatermark)
+    originalHarness.processElement1(event(staleWatermark - 1000L, 5L), staleWatermark - 1000L)
+    originalHarness.setProcessingTime(retryTime)
+    originalHarness.setProcessingTime(delayedProcessingTime)
+    originalHarness.processWatermark1(new Watermark(firstActivationWatermark))
+    originalHarness.extractOutputValues() shouldBe empty
+    originalHarness.numEventTimeTimers() shouldEqual 0
+    val snapshot = originalHarness.snapshot(12L, delayedProcessingTime)
+    originalHarness.close()
+
+    val restoredHarness = harness(new GigaTileProcessFunction(groupBy, inputSchema))
+    try {
+      restoredHarness.setup()
+      restoredHarness.initializeState(snapshot)
+      restoredHarness.open()
+      restoredHarness.setProcessingTime(delayedProcessingTime)
+      advanceToLiveWatermark(restoredHarness, firstActivationWatermark)
+      restoredHarness.setProcessingTime(cooldownTime)
+
+      restoredHarness.extractOutputValues() shouldBe empty
+      restoredHarness.numEventTimeTimers() shouldEqual 1
+      restoredHarness.processWatermark1(new Watermark(healthyLiveWatermark(cooldownTime)))
+
+      val outputs = restoredHarness.extractOutputValues()
+      outputs should have size 1
+      decodeSum(outputs.get(0)) shouldEqual 5L
+      outputs.get(0).latestTsMillis shouldEqual cooldownTime
+    } finally restoredHarness.close()
+  }
+
+  it should "recover an expired retry marker on the next keyed callback" in {
+    val staleWatermark = processingTs - new Window(10, TimeUnit.MINUTES).millis
+    val retryDelay = 2L * FlinkJob.AutoWatermarkInterval
+    val retryTime = processingTs + retryDelay
+    val originalFunction = new GigaTileProcessFunction(groupBy, inputSchema)
+    val originalHarness = harness(originalFunction)
+
+    originalHarness.open()
+    originalHarness.setProcessingTime(processingTs)
+    advanceToLiveWatermark(originalHarness, staleWatermark)
+    originalHarness.processElement1(event(staleWatermark - 1000L, 5L), staleWatermark - 1000L)
+    originalHarness.setProcessingTime(retryTime)
+    originalHarness.extractOutputValues() shouldBe empty
+    setPublicationRetryTimestamp(originalFunction, retryTime)
+    clearPublicationActivationTimestamp(originalFunction)
+    val snapshot = originalHarness.snapshot(12L, retryTime)
+    originalHarness.close()
+
+    val restoredFunction = new GigaTileProcessFunction(groupBy, inputSchema)
+    val restoredHarness = harness(restoredFunction)
+    val restoredProcessingTime = retryTime + 1L
+    val restoredRetryTime = restoredProcessingTime + retryDelay
+    try {
+      restoredHarness.setup()
+      restoredHarness.initializeState(snapshot)
+      restoredHarness.open()
+      restoredHarness.setProcessingTime(restoredProcessingTime)
+      restoredHarness.processElement1(event(staleWatermark + 1000L, 7L), staleWatermark + 1000L)
+
+      publicationRetryTimestamp(restoredFunction) shouldEqual restoredRetryTime
+      advanceToHealthyLiveWatermark(restoredHarness, restoredRetryTime)
+      restoredHarness.setProcessingTime(restoredRetryTime)
+
+      val outputs = restoredHarness.extractOutputValues()
+      outputs should have size 1
+      decodeSum(outputs.get(0)) shouldEqual 12L
+      outputs.get(0).latestTsMillis shouldEqual restoredRetryTime
+    } finally restoredHarness.close()
+  }
+
+  it should "coalesce event and batch publications from the same processing millisecond" in {
+    val dayMillis = new Window(1, TimeUnit.DAYS).millis
+    val batchGroupBy = Builders.GroupBy(
+      metaData = Builders.MetaData(name = "gigatile-process-function-collision-batch-test"),
+      aggregations = Seq(Builders.Aggregation(Operation.SUM, "num", Seq(new Window(7, TimeUnit.DAYS)))))
+    val function = new GigaTileProcessFunction(batchGroupBy, inputSchema)
+    val testHarness = harness(function)
+    val callbackProcessingTime = 3 * dayMillis + new Window(1, TimeUnit.HOURS).millis
+    val initialBatchEnd = dayMillis
+    val replacementBatchEnd = 2 * dayMillis
+    val streamEventTime = replacementBatchEnd + new Window(1, TimeUnit.HOURS).millis
+
+    try {
+      testHarness.open()
+      testHarness.setProcessingTime(callbackProcessingTime - 1L)
+      advanceToHealthyLiveWatermark(testHarness, callbackProcessingTime - 1L)
+      testHarness.processElement2(
+        batchRow(batchGroupBy, initialBatchEnd, initialBatchEnd - 1000L, 1L),
+        initialBatchEnd)
+      decodeSum(testHarness.extractOutputValues().get(0), batchGroupBy) shouldEqual 1L
+
+      testHarness.setProcessingTime(callbackProcessingTime)
+      testHarness.processElement1(event(streamEventTime, 5L), streamEventTime)
+      testHarness.processElement2(
+        batchRow(batchGroupBy, replacementBatchEnd, replacementBatchEnd - 1000L, 7L),
+        replacementBatchEnd)
+
+      val initialOutputs = testHarness.extractOutputValues()
+      initialOutputs.size() shouldEqual 2
+      decodeSum(initialOutputs.get(1), batchGroupBy) shouldEqual 6L
+      setCurrentKey(testHarness, entityKey())
+      valueState[java.lang.Boolean](function, "pendingPublicationState").value() shouldEqual
+        java.lang.Boolean.TRUE
+
+      testHarness.setProcessingTime(callbackProcessingTime + 1L)
+      val outputs = testHarness.extractOutputValues()
+      outputs.size() shouldEqual 3
+      decodeSum(outputs.get(2), batchGroupBy) shouldEqual 12L
+      outputs.get(2).latestTsMillis shouldEqual callbackProcessingTime + 1L
+      setCurrentKey(testHarness, entityKey())
+      valueState[java.lang.Boolean](function, "pendingPublicationState").value() shouldBe null
+    } finally testHarness.close()
+  }
+
+  it should "keep a restored version collision fenced without a timer storm" in {
     val originalHarness = harness(new GigaTileProcessFunction(groupBy, inputSchema))
     val firstEventTs = processingTs - 1000L
     originalHarness.open()
     originalHarness.setProcessingTime(processingTs)
+    advanceToHealthyLiveWatermark(originalHarness, processingTs)
     originalHarness.processElement1(event(firstEventTs, 5L), firstEventTs)
     originalHarness.processElement1(event(firstEventTs + 1L, 7L), firstEventTs + 1L)
     originalHarness.processElement1(event(firstEventTs + 2L, 3L), firstEventTs + 2L)
@@ -244,14 +895,19 @@ class GigaTileProcessFunctionTest extends AnyFlatSpec with Matchers {
       restoredHarness.setup()
       restoredHarness.initializeState(snapshot)
       restoredHarness.open()
-      // A delayed callback still uses the reserved strictly-newer version without moving
-      // aggregation time merely to flush the current snapshot.
       restoredHarness.setProcessingTime(processingTs + 100L)
+      restoredHarness.extractOutputValues() shouldBe empty
+      // The collision marker shares the next normal eviction timer while the connected
+      // watermark is uninitialized; it does not retry every millisecond.
+      restoredHarness.numProcessingTimeTimers() shouldEqual 1
 
+      val retryTimer = nextEvictionHop(processingTs + 100L)
+      advanceToHealthyLiveWatermark(restoredHarness, retryTimer)
+      restoredHarness.setProcessingTime(retryTimer)
       val outputs = restoredHarness.extractOutputValues()
       outputs.size() shouldEqual 1
       decodeSum(outputs.get(0)) shouldEqual 15L
-      outputs.get(0).latestTsMillis shouldEqual processingTs + 1L
+      outputs.get(0).latestTsMillis shouldEqual retryTimer
     } finally restoredHarness.close()
   }
 
@@ -262,6 +918,7 @@ class GigaTileProcessFunctionTest extends AnyFlatSpec with Matchers {
     val originalHarness = harness(originalFunction)
     originalHarness.open()
     originalHarness.setProcessingTime(processingTs)
+    advanceToHealthyLiveWatermark(originalHarness, processingTs)
     originalHarness.processElement1(event(firstEventTs, 5L), firstEventTs)
     originalHarness.processElement1(event(firstEventTs + 1L, 7L), firstEventTs + 1L)
     val originalSnapshot = originalHarness.snapshot(31L, processingTs)
@@ -287,6 +944,7 @@ class GigaTileProcessFunctionTest extends AnyFlatSpec with Matchers {
       // With no keyed callback, there is no way for open() to enumerate and repair this key.
       restoredHarness.numProcessingTimeTimers() shouldEqual 0
 
+      advanceToHealthyLiveWatermark(restoredHarness, evictionTs)
       restoredHarness.processElement1(event(firstEventTs + 2L, 3L), firstEventTs + 2L)
       setCurrentKey(restoredHarness, entityKey())
       val repairedEviction = valueState[java.lang.Long](restoredFunction,
@@ -297,6 +955,7 @@ class GigaTileProcessFunctionTest extends AnyFlatSpec with Matchers {
       repairedCollision shouldEqual repairedEviction
       restoredHarness.numProcessingTimeTimers() shouldEqual 1
 
+      advanceToHealthyLiveWatermark(restoredHarness, repairedCollision)
       restoredHarness.setProcessingTime(repairedCollision)
 
       val outputs = restoredHarness.extractOutputValues()
@@ -318,6 +977,7 @@ class GigaTileProcessFunctionTest extends AnyFlatSpec with Matchers {
     val originalHarness = harness(new GigaTileProcessFunction(groupBy, inputSchema))
     originalHarness.open()
     originalHarness.setProcessingTime(justBeforeExpiry)
+    advanceToHealthyLiveWatermark(originalHarness, justBeforeExpiry)
     originalHarness.processElement1(event(eventTs, 5L), eventTs)
     val originalSnapshot = originalHarness.snapshot(33L, justBeforeExpiry)
     originalHarness.close()
@@ -338,6 +998,7 @@ class GigaTileProcessFunctionTest extends AnyFlatSpec with Matchers {
       restoredHarness.open()
       // Flink reports this jump target while it first drains injectedTimer. That earlier
       // callback must not steal ownership from the still-queued evictionTimer.
+      advanceToHealthyLiveWatermark(restoredHarness, evictionTimer)
       restoredHarness.setProcessingTime(evictionTimer)
 
       val outputs = restoredHarness.extractOutputValues()
@@ -358,6 +1019,7 @@ class GigaTileProcessFunctionTest extends AnyFlatSpec with Matchers {
     val originalHarness = harness(new GigaTileProcessFunction(groupBy, inputSchema))
     originalHarness.open()
     originalHarness.setProcessingTime(processingTs)
+    advanceToHealthyLiveWatermark(originalHarness, processingTs)
     originalHarness.processElement1(event(firstEventTs, 5L), firstEventTs)
     originalHarness.processElement1(event(firstEventTs + 1L, 7L), firstEventTs + 1L)
     val originalSnapshot = originalHarness.snapshot(35L, processingTs)
@@ -391,6 +1053,7 @@ class GigaTileProcessFunctionTest extends AnyFlatSpec with Matchers {
       restoredHarness.setProcessingTime(consumedCollisionTimer)
       // The injected callback runs first while Flink already reports evictionTimer as the
       // current processing time. The stale collision must join that still-queued eviction.
+      advanceToHealthyLiveWatermark(restoredHarness, evictionTimer)
       restoredHarness.setProcessingTime(evictionTimer)
 
       val outputs = restoredHarness.extractOutputValues()
@@ -411,6 +1074,7 @@ class GigaTileProcessFunctionTest extends AnyFlatSpec with Matchers {
     try {
       testHarness.open()
       testHarness.setProcessingTime(processingTs)
+      advanceToHealthyLiveWatermark(testHarness, processingTs)
       failNextEncode(function)
       testHarness.processElement1(event(firstEventTs, 5L), firstEventTs)
 
@@ -428,32 +1092,31 @@ class GigaTileProcessFunctionTest extends AnyFlatSpec with Matchers {
     } finally testHarness.close()
   }
 
-  it should "re-arm a version collision when snapshot construction fails" in {
+  it should "keep a failed collision on a queued eviction while draining delayed callbacks" in {
     val function = new GigaTileProcessFunction(groupBy, inputSchema)
     val testHarness = harness(function)
     val firstEventTs = processingTs - 1000L
+    val retryTimer = nextEvictionHop(processingTs)
 
     try {
       testHarness.open()
       testHarness.setProcessingTime(processingTs)
+      advanceToHealthyLiveWatermark(testHarness, processingTs)
       testHarness.processElement1(event(firstEventTs, 5L), firstEventTs)
       testHarness.processElement1(event(firstEventTs + 1L, 7L), firstEventTs + 1L)
 
       testHarness.extractOutputValues().size() shouldEqual 1
       failNextSnapshot(function)
 
-      testHarness.setProcessingTime(processingTs + 1L)
-
-      testHarness.extractOutputValues().size() shouldEqual 1
-      // The normal eviction timer and the re-armed collision timer must both remain live.
-      testHarness.numProcessingTimeTimers() shouldEqual 2
-
-      testHarness.setProcessingTime(processingTs + 2L)
+      // Flink drains the earlier collision callback while already reporting retryTimer as the
+      // wall clock. A transient failure must keep the collision on the queued eviction timer.
+      advanceToHealthyLiveWatermark(testHarness, retryTimer)
+      testHarness.setProcessingTime(retryTimer)
 
       val outputs = testHarness.extractOutputValues()
       outputs.size() shouldEqual 2
       decodeSum(outputs.get(1)) shouldEqual 12L
-      outputs.get(1).latestTsMillis shouldEqual processingTs + 2L
+      outputs.get(1).latestTsMillis shouldEqual retryTimer
       testHarness.numProcessingTimeTimers() shouldEqual 1
     } finally testHarness.close()
   }
@@ -468,6 +1131,7 @@ class GigaTileProcessFunctionTest extends AnyFlatSpec with Matchers {
     try {
       testHarness.open()
       testHarness.setProcessingTime(collisionProcessingTs)
+      advanceToHealthyLiveWatermark(testHarness, collisionProcessingTs)
       testHarness.processElement1(event(expiringEventTs, 5L), expiringEventTs)
       testHarness.processElement1(event(expiringEventTs, 7L), expiringEventTs)
 
@@ -493,6 +1157,7 @@ class GigaTileProcessFunctionTest extends AnyFlatSpec with Matchers {
     try {
       testHarness.open()
       testHarness.setProcessingTime(collisionProcessingTs)
+      advanceToHealthyLiveWatermark(testHarness, collisionProcessingTs)
       testHarness.processElement1(event(expiringEventTs, 5L), expiringEventTs)
       testHarness.processElement1(event(expiringEventTs, 7L), expiringEventTs)
       failNextEviction(function)
@@ -505,6 +1170,7 @@ class GigaTileProcessFunctionTest extends AnyFlatSpec with Matchers {
       testHarness.setProcessingTime(evictionTs + 1L)
       testHarness.extractOutputValues().size() shouldEqual 1
 
+      advanceToHealthyLiveWatermark(testHarness, retryTs)
       testHarness.setProcessingTime(retryTs)
 
       val outputs = testHarness.extractOutputValues()
@@ -522,6 +1188,7 @@ class GigaTileProcessFunctionTest extends AnyFlatSpec with Matchers {
     try {
       testHarness.open()
       testHarness.setProcessingTime(processingTs)
+      advanceToHealthyLiveWatermark(testHarness, processingTs)
       testHarness.processElement1(keyedEvent("campaign-1", firstEventTs, 5L), firstEventTs)
       testHarness.processElement1(keyedEvent("campaign-1", firstEventTs + 1L, 7L), firstEventTs + 1L)
       testHarness.processElement1(keyedEvent("campaign-2", firstEventTs, 11L), firstEventTs)
@@ -546,6 +1213,7 @@ class GigaTileProcessFunctionTest extends AnyFlatSpec with Matchers {
     try {
       testHarness.open()
       testHarness.setProcessingTime(exactHopTs)
+      advanceToHealthyLiveWatermark(testHarness, exactHopTs)
       testHarness.processElement1(event(exactHopTs, 5L), exactHopTs)
 
       val output = testHarness.extractOutputValues().get(0)
@@ -569,6 +1237,7 @@ class GigaTileProcessFunctionTest extends AnyFlatSpec with Matchers {
       restoredHarness.initializeState(snapshot)
       restoredHarness.open()
       restoredHarness.setProcessingTime(batchCallbackTs)
+      advanceToHealthyLiveWatermark(restoredHarness, batchCallbackTs)
       restoredHarness.processElement2(emptyBatchRow(groupBy, batchEndTs = 0L), 0L)
 
       val outputs = restoredHarness.extractOutputValues()
@@ -612,6 +1281,7 @@ class GigaTileProcessFunctionTest extends AnyFlatSpec with Matchers {
       restoredHarness.initializeState(snapshot)
       restoredHarness.open()
       restoredHarness.setProcessingTime(delayedCallbackTs)
+      advanceToHealthyLiveWatermark(restoredHarness, delayedCallbackTs)
       restoredHarness.processElement1(event(delayedCallbackTs - 1L, 7L), delayedCallbackTs - 1L)
 
       val outputs = restoredHarness.extractOutputValues()
@@ -649,6 +1319,72 @@ object GigaTileProcessFunctionTest {
 
   private def event(timestamp: Long, value: Long): ProjectedEvent =
     ProjectedEvent(Map(Constants.TimeColumn -> timestamp, "num" -> value), timestamp)
+
+  private def advanceToLiveWatermark(
+      testHarness: KeyedTwoInputStreamOperatorTestHarness[
+        util.List[Any],
+        ProjectedEvent,
+        BatchIrRow,
+        TimestampedTile],
+      watermark: Long
+  ): Unit = {
+    testHarness.processWatermarkStatus2(WatermarkStatus.IDLE)
+    testHarness.processWatermark1(new Watermark(watermark))
+  }
+
+  private def healthyLiveWatermark(processingTime: Long): Long =
+    processingTime - FlinkJob.AllowedOutOfOrderness.toMillis - 1L
+
+  private def liveActivationWatermark(processingTime: Long): Long =
+    processingTime - FlinkJob.LiveWatermarkLagToleranceMillis
+
+  private def advanceToHealthyLiveWatermark(
+      testHarness: KeyedTwoInputStreamOperatorTestHarness[
+        util.List[Any],
+        ProjectedEvent,
+        BatchIrRow,
+        TimestampedTile],
+      processingTime: Long
+  ): Unit =
+    advanceToLiveWatermark(testHarness, healthyLiveWatermark(processingTime))
+
+  private def nextDay(timestamp: Long): Long = {
+    val dayMillis = new Window(1, TimeUnit.DAYS).millis
+    TsUtils.round(timestamp, dayMillis) + dayMillis
+  }
+
+  private def currentProcessor(function: GigaTileProcessFunction): GigaTileStreamProcessor = {
+    val processorField = classOf[GigaTileProcessFunction].getDeclaredField("processor")
+    processorField.setAccessible(true)
+    processorField.get(function).asInstanceOf[GigaTileStreamProcessor]
+  }
+
+  private def publicationTimerState(
+      function: GigaTileProcessFunction,
+      fieldName: String
+  ): ValueState[java.lang.Long] = {
+    val stateField = classOf[GigaTileProcessFunction].getDeclaredField(fieldName)
+    stateField.setAccessible(true)
+    stateField.get(function).asInstanceOf[ValueState[java.lang.Long]]
+  }
+
+  private def publicationRetryTimestamp(function: GigaTileProcessFunction): Long =
+    publicationTimerState(function, "pendingPublicationRetryTimerState").value().longValue()
+
+  private def setPublicationRetryTimestamp(function: GigaTileProcessFunction, timestamp: Long): Unit =
+    publicationTimerState(function, "pendingPublicationRetryTimerState").update(timestamp)
+
+  private def clearPublicationActivationTimestamp(function: GigaTileProcessFunction): Unit =
+    publicationTimerState(function, "pendingPublicationActivationTimerState").clear()
+
+  private def currentFinalizedSum(function: GigaTileProcessFunction): AnyRef =
+    currentProcessor(function).currentSnapshot.finalizedVector(0).asInstanceOf[AnyRef]
+
+  private def currentDayStart(function: GigaTileProcessFunction): Long =
+    currentProcessor(function).store.getCurrentDayStart
+
+  private def dailyLargeSlotCount(function: GigaTileProcessFunction): Int =
+    currentProcessor(function).store.dailyLargeIrIterator.size
 
   private def keyedEvent(entity: String, timestamp: Long, value: Long): ProjectedEvent =
     ProjectedEvent(Map("entity" -> entity, Constants.TimeColumn -> timestamp, "num" -> value), timestamp)
@@ -763,6 +1499,21 @@ object GigaTileProcessFunctionTest {
       new SawtoothOnlineAggregator(batchEndTs, batchGroupBy.getAggregations.asScala.toSeq, inputSchema)
     val emptyBatchIr = batchAggregator.denormalizeBatchIr(batchAggregator.normalizeBatchIr(batchAggregator.init))
     new BatchIrRow(entityKey(), new GigaTileCodec(batchGroupBy, inputSchema).encodeBatchIr(emptyBatchIr), batchEndTs)
+  }
+
+  private def batchRow(
+      batchGroupBy: GroupBy,
+      batchEndTs: Long,
+      batchEventTs: Long,
+      value: Long
+  ): BatchIrRow = {
+    val batchAggregator =
+      new SawtoothOnlineAggregator(batchEndTs, batchGroupBy.getAggregations.asScala.toSeq, inputSchema)
+    val batchIr = batchAggregator.update(
+      batchAggregator.init,
+      new ArrayRow(Array[Any](batchEventTs, value), batchEventTs))
+    val finalBatchIr = batchAggregator.denormalizeBatchIr(batchAggregator.normalizeBatchIr(batchIr))
+    new BatchIrRow(entityKey(), new GigaTileCodec(batchGroupBy, inputSchema).encodeBatchIr(finalBatchIr), batchEndTs)
   }
 
   private class LegacyEventTimeTimerFunction(timerTimestamps: Seq[Long])

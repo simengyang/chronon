@@ -713,6 +713,34 @@ class GigaTileBugRegressionTest extends AnyFlatSpec {
     )
   }
 
+  it should "retain uncovered daily slots required by an unwindowed column" in {
+    val aggregations = mixedBoundaryAggregations
+    val megaTileAgg = new MegaTileAggregator(aggregations, schema, tailBufferMillis = TailBufferMillis)
+    val store = new InMemoryGigaTileStore(megaTileAgg.windowedAggregator)
+    val processor = new GigaTileStreamProcessor(megaTileAgg, store)
+    val day0 = TsUtils.round(1700000000000L, DayMillis)
+    val event = new TestRow(day0 + HourMillis, 5L)(0)
+
+    processor.onBatchUpdate(emptyBatchIr(day0, aggregations), day0, day0)
+    processor.advanceWatermark(event.ts)
+    processor.onEvent(event, event.ts)
+
+    val queryTs = day0 + 10 * DayMillis
+    processor.advanceWatermark(queryTs)
+    val beforeBatchCoverage = processor.onEviction(queryTs)
+
+    assertNotNull("the uncovered day must remain available to the unwindowed column",
+                  store.getDailyLargeIr(day0))
+    assertEquals(5L, beforeBatchCoverage.finalizedVector(2))
+
+    val coveringBatchEnd = day0 + DayMillis
+    val coveringBatch = batchIrFromEvents(Array(event), coveringBatchEnd, aggregations)
+    val afterBatchCoverage = processor.onBatchUpdate(coveringBatch, coveringBatchEnd, queryTs)
+
+    assertNull("the daily slot can be removed once batch state covers it", store.getDailyLargeIr(day0))
+    assertEquals(5L, afterBatchCoverage.finalizedVector(2))
+  }
+
   it should "FAIL: consecutive all-empty eviction emits must be suppressed even under default irEqual" in {
     val window = new Window(1, TimeUnit.HOURS)
     val aggregations: Seq[Aggregation] = Seq(Builders.Aggregation(Operation.SUM, "num", Seq(window)))

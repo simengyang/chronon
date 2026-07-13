@@ -3,16 +3,18 @@ package ai.chronon.flink.test
 import ai.chronon.api._
 import ai.chronon.api.Extensions.GroupByOps
 import ai.chronon.api.ScalaJavaConversions._
-import ai.chronon.flink.{GigaTileAvroCodecFn, SparkExpressionEval, SparkExpressionEvalFn}
+import ai.chronon.flink.deser.ProjectedEvent
+import ai.chronon.flink.{FlinkJob, GigaTileAvroCodecFn, SparkExpressionEval, SparkExpressionEvalFn}
 import ai.chronon.flink.types.{BatchIrRow, TimestampedTile, WriteResponse}
 import ai.chronon.flink.window.GigaTileProcessFunction
 import ai.chronon.online.{Api, GigaTileCodec, GroupByServingInfoParsed}
-import ai.chronon.online.serde.SparkConversions
-import org.apache.flink.api.common.eventtime.WatermarkStrategy
+import ai.chronon.online.serde.{AvroCodec, SparkConversions}
 import org.apache.flink.runtime.testutils.MiniClusterResourceConfiguration
 import org.apache.flink.streaming.api.datastream.DataStream
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment
+import org.apache.flink.streaming.api.functions.sink.SinkFunction
 import org.apache.flink.streaming.api.functions.source.SourceFunction
+import org.apache.flink.streaming.api.watermark.Watermark
 import org.apache.flink.test.util.MiniClusterWithClientResource
 import org.apache.spark.sql.Encoders
 import org.mockito.Mockito.withSettings
@@ -21,8 +23,8 @@ import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers._
 import org.scalatestplus.mockito.MockitoSugar.mock
 
-import java.time.Duration
 import java.util
+import java.util.concurrent.{CountDownLatch, TimeUnit}
 
 /** Flink MiniCluster integration test for the PUSH (giga tile) pipeline.
   *
@@ -46,6 +48,7 @@ class GigaTilePushFlinkIntegrationTest extends AnyFlatSpec with BeforeAndAfter {
   before {
     flinkCluster.before()
     CollectSink.values.clear()
+    GigaTilePushIntegrationSourceGate.reset()
   }
 
   after {
@@ -88,8 +91,6 @@ class GigaTilePushFlinkIntegrationTest extends AnyFlatSpec with BeforeAndAfter {
     val query = SparkExpressionEval.queryFromGroupBy(groupBy)
     val sparkExprEvalFn =
       new SparkExpressionEvalFn(Encoders.product[E2ETestEvent], query, groupBy.metaData.name, groupBy.dataModel)
-    val source = new WatermarkedE2EEventSource(elements, sparkExprEvalFn)
-
     val encoder = Encoders.product[E2ETestEvent]
     val outputSchema =
       new SparkExpressionEval(encoder, query, groupBy.getMetaData.getName, groupBy.dataModel).getOutputSchema
@@ -100,10 +101,14 @@ class GigaTilePushFlinkIntegrationTest extends AnyFlatSpec with BeforeAndAfter {
     val groupByServingInfoParsed =
       makePushGroupByServingInfoParsed(groupBy, encoder.schema, outputSchema)
 
-    // Event stream with watermarks
-    val preparedStream = source
-      .getDataStream("test-topic", groupBy.metaData.name)(env, 2)
+    // The production sources are unbounded, but this fixture is bounded and would otherwise
+    // finish before a periodic watermark or processing-time timer can flush fenced state.
+    // Establish a finite watermark before records after the empty batch input is ready.
+    val preparedStream = env
+      .addSource(new LiveWatermarkedE2EEventSource(elements))
       .uid(s"source-${groupBy.metaData.name}")
+      .flatMap(sparkExprEvalFn)
+      .map(e => ProjectedEvent(e, System.currentTimeMillis()))
 
     // Empty batch stream: completes immediately (so env.execute returns),
     // watermark goes to MAX on completion (doesn't stall event stream's watermark).
@@ -154,7 +159,7 @@ class GigaTilePushFlinkIntegrationTest extends AnyFlatSpec with BeforeAndAfter {
 
     val groupBy = makePushGroupBy(Seq("id"))
     val (writeDS, servingInfo) = buildPushPipeline(groupBy, elements)
-    writeDS.addSink(new CollectSink)
+    writeDS.addSink(new GigaTileCollectSink(expectedKeyCount = 2))
 
     env.execute("PushFlinkIntegrationTest")
 
@@ -163,7 +168,8 @@ class GigaTilePushFlinkIntegrationTest extends AnyFlatSpec with BeforeAndAfter {
     // All writes should succeed
     results.forall(_.status) shouldBe true
 
-    // Same-millisecond updates may be coalesced, but every entity must publish final state.
+    // Same-millisecond coalescing and replay fencing may emit fewer writes, but every entity
+    // must publish final state.
     val keyHashes = results.map(result => util.Arrays.hashCode(result.keyBytes)).distinct
     keyHashes.size shouldBe 2
 
@@ -185,7 +191,7 @@ class GigaTilePushFlinkIntegrationTest extends AnyFlatSpec with BeforeAndAfter {
 
     val groupBy = makePushGroupBy(Seq("id"))
     val (writeDS, servingInfo) = buildPushPipeline(groupBy, elements)
-    writeDS.addSink(new CollectSink)
+    writeDS.addSink(new GigaTileCollectSink(servingInfo.outputCodec, Set(8.0)))
 
     env.execute("PushFlinkDecodableTest")
 
@@ -219,7 +225,7 @@ class GigaTilePushFlinkIntegrationTest extends AnyFlatSpec with BeforeAndAfter {
 
     val groupBy = makePushGroupBy(Seq("id"))
     val (writeDS, servingInfo) = buildPushPipeline(groupBy, elements)
-    writeDS.addSink(new CollectSink)
+    writeDS.addSink(new GigaTileCollectSink(servingInfo.outputCodec, Set(15.0, 20.0)))
 
     env.execute("PushFlinkKeyIsolationTest")
 
@@ -252,6 +258,105 @@ class GigaTilePushFlinkIntegrationTest extends AnyFlatSpec with BeforeAndAfter {
   * so the event stream drives watermark progression normally.
   */
 class EmptyBatchIrSource extends SourceFunction[BatchIrRow] {
-  override def run(ctx: SourceFunction.SourceContext[BatchIrRow]): Unit = {}
+  override def run(ctx: SourceFunction.SourceContext[BatchIrRow]): Unit = {
+    ctx.emitWatermark(new Watermark(Long.MaxValue))
+    GigaTilePushIntegrationSourceGate.batchInputReady()
+  }
   override def cancel(): Unit = {}
+}
+
+/** Bounded event source that establishes a near-live watermark before emitting records. */
+class LiveWatermarkedE2EEventSource(elements: Seq[E2ETestEvent]) extends SourceFunction[E2ETestEvent] {
+  @volatile private var running = true
+
+  private def boundedOutOfOrdernessWatermark(maxEventTime: Long): Long = {
+    val delta = FlinkJob.AllowedOutOfOrderness.toMillis + 1L
+    if (maxEventTime < Long.MinValue + delta) Long.MinValue else maxEventTime - delta
+  }
+
+  override def run(ctx: SourceFunction.SourceContext[E2ETestEvent]): Unit = {
+    if (!GigaTilePushIntegrationSourceGate.awaitBatchInput()) {
+      throw new IllegalStateException("Timed out waiting for the empty batch input")
+    }
+
+    val sourceStartTime = System.currentTimeMillis()
+    val latestOriginalEventTime = elements.map(_.created).reduceOption((left, right) => math.max(left, right))
+      .getOrElse(sourceStartTime)
+    val rebasedElements = elements.map { event =>
+      event.copy(created = sourceStartTime - (latestOriginalEventTime - event.created))
+    }
+    val lock = ctx.getCheckpointLock
+    rebasedElements.headOption.foreach { firstEvent =>
+      val initialWatermark = boundedOutOfOrdernessWatermark(firstEvent.created)
+      lock.synchronized(ctx.emitWatermark(new Watermark(initialWatermark)))
+    }
+
+    var maxEventTime = Long.MinValue
+    rebasedElements.iterator.takeWhile(_ => running).foreach { event =>
+      lock.synchronized {
+        maxEventTime = math.max(maxEventTime, event.created)
+        ctx.collectWithTimestamp(event, event.created)
+        ctx.emitWatermark(new Watermark(boundedOutOfOrdernessWatermark(maxEventTime)))
+      }
+    }
+
+    if (running && !GigaTilePushIntegrationSourceGate.awaitOutput()) {
+      throw new IllegalStateException("Timed out waiting for GigaTile output")
+    }
+  }
+
+  override def cancel(): Unit = running = false
+}
+
+private object GigaTilePushIntegrationSourceGate {
+  @volatile private var batchReady = new CountDownLatch(1)
+  @volatile private var outputReady = new CountDownLatch(1)
+
+  def reset(): Unit = {
+    batchReady = new CountDownLatch(1)
+    outputReady = new CountDownLatch(1)
+  }
+
+  def batchInputReady(): Unit = batchReady.countDown()
+
+  def awaitBatchInput(): Boolean = batchReady.await(10, TimeUnit.SECONDS)
+
+  def outputObserved(): Unit = outputReady.countDown()
+
+  def awaitOutput(): Boolean = outputReady.await(30, TimeUnit.SECONDS)
+}
+
+private class GigaTileCollectSink(
+    outputCodec: AvroCodec = null,
+    expectedFinalSums: Set[Double] = Set.empty,
+    expectedKeyCount: Int = 1)
+    extends SinkFunction[WriteResponse] {
+
+  private def completionObserved: Boolean = {
+    val results = CollectSink.values.synchronized(CollectSink.values.toScala.toSeq)
+    if (expectedFinalSums.nonEmpty) {
+      val sumFieldName = outputCodec.decodeMap(results.head.valueBytes).keys
+        .find(_.contains("double_val"))
+        .get
+      val latestSumPerKey = results
+        .groupBy(result => util.Arrays.hashCode(result.keyBytes))
+        .values
+        .flatMap { writes =>
+          val nonEmpty = writes.flatMap { write =>
+            val decoded = outputCodec.decodeMap(write.valueBytes)
+            Option(decoded(sumFieldName)).map(value => (write.tsMillis, value.asInstanceOf[Double]))
+          }
+          if (nonEmpty.isEmpty) None else Some(nonEmpty.maxBy(_._1)._2)
+        }
+        .toSet
+      latestSumPerKey == expectedFinalSums
+    } else {
+      results.map(result => util.Arrays.hashCode(result.keyBytes)).distinct.size >= expectedKeyCount
+    }
+  }
+
+  override def invoke(value: WriteResponse, context: SinkFunction.Context): Unit = {
+    CollectSink.values.add(value)
+    if (completionObserved) GigaTilePushIntegrationSourceGate.outputObserved()
+  }
 }

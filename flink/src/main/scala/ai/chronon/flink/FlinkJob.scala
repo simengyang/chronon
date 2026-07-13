@@ -275,6 +275,12 @@ object FlinkJob {
 
   val CatchupWatermarkLagSlackMillis: Long = 30 * 1000L
 
+  // The event-source watermark intentionally trails the newest observed event by
+  // AllowedOutOfOrderness. Publication is safe once only that expected lag plus a small
+  // operational slack remains; aggregation hop sizes do not describe source readiness.
+  val LiveWatermarkLagToleranceMillis: Long =
+    AllowedOutOfOrderness.toMillis + CatchupWatermarkLagSlackMillis
+
   // Set an idleness timeout to keep time moving in case of very low traffic event streams as well as late events during
   // large backlog catchups
   val IdlenessTimeout: Duration = Duration.ofSeconds(30)

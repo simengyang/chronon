@@ -118,19 +118,21 @@ class MegaTileAggregator(aggregations: Seq[Aggregation],
   val hopSizesArray: Array[Long] = hopSizes
   val baseIrIndicesArray: Array[Int] = baseIrIndices
 
-  /** Largest window across all windowed columns, in millis. Used by GigaTile to bound daily-
-    * slot retention: any slot whose dayStart + DayMillis is older than (queryTs - maxWindowMillis)
-    * cannot contribute to any column and can be evicted from state.
+  /** Largest retention horizon across all columns, in millis. Used by GigaTile to bound daily-
+    * slot retention. Unwindowed columns retain uncovered slots until a later batch includes them,
+    * so their horizon is intentionally unbounded.
     */
   val maxWindowMillis: Long = {
     var m: Long = 0L
+    var hasUnwindowedColumn = false
     var i = 0
     while (i < windowMappings.length) {
       val w = windowMappings(i).aggregationPart.window
-      if (w != null && w.millis > m) m = w.millis
+      if (w == null) hasUnwindowedColumn = true
+      else if (w.millis > m) m = w.millis
       i += 1
     }
-    m
+    if (hasUnwindowedColumn) Long.MaxValue else m
   }
 
   /** Per-windowed-column window in millis. -1 for unwindowed columns (which always include the slot). */
