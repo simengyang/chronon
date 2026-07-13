@@ -7,7 +7,7 @@ import ai.chronon.flink.deser.ProjectedEvent
 import ai.chronon.flink.source.FlinkSource
 import ai.chronon.flink.source.BatchIrSourceBuilder
 import ai.chronon.flink.types.{AvroCodecOutput, WriteResponse}
-import ai.chronon.flink.window.MegaTileEmissionPolicy
+import ai.chronon.flink.window.{GigaTileProcessFunction, MegaTileEmissionPolicy}
 import ai.chronon.online.{GroupByServingInfoParsed, TopicInfo}
 import org.apache.flink.streaming.api.datastream.DataStream
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment
@@ -51,6 +51,8 @@ class FlinkGroupByStreamingJob(eventSrc: FlinkSource[ProjectedEvent],
     FlinkUtils.getNonNegativeLongProperty("buffering_output_time_millis", props, topicInfo)
   private val bufferingOutputJitterMillis =
     FlinkUtils.getNonNegativeLongProperty("buffering_output_jitter_millis", props, topicInfo)
+  private val firstSeenKeyGraceMillis =
+    FlinkUtils.getNonNegativeLongProperty(GigaTileProcessFunction.FirstSeenKeyGraceMillisConfig, props, topicInfo)
   private val bufferingOutputPolicy =
     FlinkUtils
       .getProperty("buffering_output_policy", props, topicInfo)
@@ -153,7 +155,10 @@ class FlinkGroupByStreamingJob(eventSrc: FlinkSource[ProjectedEvent],
   override def runGigaTiledGroupByJob(env: StreamExecutionEnvironment): DataStream[WriteResponse] = {
     logger.info(f"Running Giga Tiled (push) Flink job for groupByName=${groupByName}, Topic=${topic}.")
     val preparedStream = buildSourceStream(env)
-    val batchIrStream = BatchIrSourceBuilder.build(env, groupByServingInfoParsed, props)
+    val batchIrStream = BatchIrSourceBuilder.build(env,
+                                                   groupByServingInfoParsed,
+                                                   props,
+                                                   requireConfiguredBatchSource = firstSeenKeyGraceMillis > 0L)
     buildGigaTiledTail(preparedStream,
                        batchIrStream,
                        inputSchema,
@@ -161,7 +166,8 @@ class FlinkGroupByStreamingJob(eventSrc: FlinkSource[ProjectedEvent],
                        sinkFn,
                        kvStoreCapacity,
                        enableDebug,
-                       gigaTileBufferingOutputTimeMillis)
+                       gigaTileBufferingOutputTimeMillis,
+                       firstSeenKeyGraceMillis)
   }
 
   private def buildSourceStream(env: StreamExecutionEnvironment): DataStream[ProjectedEvent] = {

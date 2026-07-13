@@ -166,7 +166,8 @@ class GigaTileProcessFunctionTest extends AnyFlatSpec with Matchers {
     val batchGroupBy = Builders.GroupBy(
       metaData = Builders.MetaData(name = "gigatile-process-function-future-batch-test"),
       aggregations = Seq(Builders.Aggregation(Operation.SUM, "num", Seq(new Window(7, TimeUnit.DAYS)))))
-    val testHarness = harness(new GigaTileProcessFunction(batchGroupBy, inputSchema))
+    val function = new GigaTileProcessFunction(batchGroupBy, inputSchema)
+    val testHarness = harness(function)
     val batchCodec = new GigaTileCodec(batchGroupBy, inputSchema)
     val currentBatchEnd = 10 * dayMillis
     val currentProcessingTs = currentBatchEnd + hourMillis
@@ -191,11 +192,12 @@ class GigaTileProcessFunctionTest extends AnyFlatSpec with Matchers {
       testHarness.extractOutputValues().asScala shouldBe empty
       // A short watermark retry and the normal eviction timer are both live initially.
       testHarness.numProcessingTimeTimers() shouldEqual 2
+      valueState[java.lang.Long](function, "nextProcessingEvictionTimerState").value() should not be null
 
       testHarness.setProcessingTime(currentProcessingTs + hourMillis)
 
       testHarness.extractOutputValues().asScala shouldBe empty
-      testHarness.numProcessingTimeTimers() shouldEqual 1
+      valueState[java.lang.Long](function, "nextProcessingEvictionTimerState").value() should not be null
 
       advanceToHealthyLiveWatermark(testHarness, futureBatchEnd + hourMillis)
       testHarness.setProcessingTime(futureBatchEnd + hourMillis)

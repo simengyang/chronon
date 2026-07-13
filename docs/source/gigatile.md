@@ -421,12 +421,14 @@ Mar 26 06:00  events continue        runningLargeIr updated incrementally.
 
 ### Emit strategy
 
-No suppress logic inside Flink. Flink always emits when it has something to emit.
-The serving layer doesn't route traffic until the orchestrator signals "ready."
+Flink continues rebuilding state during replay, but PUSH writes are fenced until the connected
+watermark is near wall clock. A batch source that is still active can hold that watermark at
+`MIN`; source idleness lets it advance but does not prove the initial scan completed. An optional
+write cadence can further coalesce hot-key updates after the fence opens.
 
 **Emit triggers:**
-- **Event arrival**: emit on every event (existing mega tile behavior).
-- **Eviction timer**: emit on periodic eviction (existing).
+- **Event arrival**: update state and publish only when the replay fence is open.
+- **Eviction timer**: rebuild expired state and publish a changed or deferred snapshot.
 - **Batch IR update**: emit if `runningLargeIr` changed. Single rule covers
   null→value (first batch load), batch correction, tail shift, no-change skip.
 
@@ -441,47 +443,33 @@ def onBatchUpdate(newBatchIr, newBatchEnd):
     emit(finalize(pack(cachedSmallWindowIr, runningLargeIr)))
 ```
 
-### Readiness signal
+### Readiness
 
-The Flink job exposes a readiness condition: **initial Iceberg scan complete AND watermark
-caught up** (within configurable `maxLag` of wall clock). The orchestrator checks this
-before routing model traffic to the giga tile KV dataset.
-
-```
-isReady = icebergInitialScanComplete
-          AND currentWatermark >= System.currentTimeMillis() - maxLag
-```
-
-This is a metric/health endpoint — not part of the emit logic. Flink doesn't gate emits
-on readiness. It writes to KV freely. The orchestrator decides when to trust the output.
+The implementation has no positive initial-Iceberg-scan-complete signal. A near-live connected
+watermark proves Kafka catch-up, not batch coverage. Rollout tooling must validate batch input and
+serving output separately before routing traffic.
 
 ### Kafka replay on cold start
 
-On cold start (no checkpoint), Flink replays Kafka from `batchEndTs` to reconstruct
-streaming state. During replay, Flink emits progressively-building vectors. This is fine
-because the orchestrator hasn't signaled "ready" yet — no traffic is routed.
+On cold start (no checkpoint), Flink rebuilds batch and streaming state from the configured
+sources. Serving writes remain fenced until the connected watermark reaches `Live`.
 
 ```
 Cold start / first startup:
 1. Flink starts with no state
 2. Iceberg source scans upload table (latest ds partition)
-   → all entities get batch IR via onBatchUpdate
-   → null→value trigger: each entity emits batch-only vector
-3. Kafka consumer starts from batchEndTs offset
-   → replays events from [batchEnd, now)
-   → each event emits updated vector (progressively improving)
-4. Watermark catches up + Iceberg scan done → isReady = true
-5. Orchestrator routes traffic → fetcher reads correct vectors
+   → rows populate batch state as they arrive
+3. Kafka replay rebuilds retained streaming state
+4. Connected watermark reaches `Live`
+   → the latest deferred snapshot can publish (subject to optional cadence)
+5. Rollout tooling validates batch coverage and serving output before routing traffic
 ```
-
-During replay (steps 2-3), the KV store has intermediate vectors. Nobody reads them
-because readiness hasn't been signaled.
 
 ### Kafka retention requirement
 
-Kafka topic retention must be ≥ max batch staleness (typically 2 days). This ensures
-events from `[batchEnd, now)` are available for replay. For GroupBys with only small
-windows (≤ 2d), retention must cover the max window size.
+Kafka retention must cover the actual gap from `batchEnd` through replay plus the required
+correctness horizon. For GroupBys with only small windows, it must also cover the maximum
+window size.
 
 ### Key completeness
 
@@ -489,91 +477,38 @@ windows (≤ 2d), retention must cover the max window size.
 
 Yes, for all temporal entities:
 - **Inactive entities** (in batch table, no recent streaming events): Iceberg source
-  emits their batch IR → null→value trigger → batch-only vector emitted to KV.
-- **Active entities**: batch-only vector first (Iceberg), then corrected with streaming
-  during Kafka replay.
-- **New entities (in Kafka, not in batch)**: first event creates Flink state. `batchIr`
-  is null → streaming-only vector emitted. Correct for entities with no history.
-  Next batch run picks them up via onBatchUpdate (null→value trigger).
+  loads their batch IR; the batch-only vector can publish after the live fence opens.
+- **Active entities**: Iceberg and Kafka replay rebuild one deferred snapshot, which can
+  publish after the live fence opens.
+- **New entities (in Kafka, not in batch)**: first event creates Flink state. Columns that
+  require batch history remain unset until a batch row arrives, unless the batch-absent
+  fallback below is explicitly enabled.
+
+`gigatile_first_seen_key_grace_millis` enables the batch-absent fallback when set to a
+positive value; it is disabled by default. The operator-local grace starts on the first keyed
+callback after open or restore. Its deadline is a lower bound: the fallback installs on the next
+eligible keyed callback, which may be the next 5m, 1h, or 1d eviction for a sparse key. A missing
+row may then be treated as empty history, while a later real batch row remains authoritative.
+The grace is an operational assertion, not proof that the initial Iceberg scan completed.
+Enabling it therefore requires a configured Iceberg source and fails the job on source
+construction or entity-row decode/update errors; the serving-info metadata row is ignored.
+
+To roll back this option, fence serving first, disable it on the current binary, and keep serving
+fenced until null corrections are verified in KV and a later checkpoint completes. Only then
+roll back the binary or unfence. Correction waits for a live watermark and the affected key's
+next eviction callback (5m, 1h, or 1d), so binary rollback alone is not an immediate retraction.
 
 **Note:** Giga tile only applies to `Accuracy.TEMPORAL` GroupBys (with a streaming topic).
 `SNAPSHOT` GroupBys bypass Flink — they use the traditional `bulkPut` from Spark to KV.
 
-### Startup timeline
+## Entity behavior
 
-```
-Time          KV state                              isReady
-──────────    ──────────────────────────────────     ───────
-T+0           Empty                                  false
-T+1 min       Batch-only vectors appearing           false
-              (Iceberg scan in progress)
-T+5 min       All batch entities in KV               false
-              (Iceberg scan complete)
-              Streaming entities: partial
-              (Kafka replay in progress)
-T+10 min      All entities fully correct             true
-              (watermark caught up)
-              Orchestrator routes traffic
-```
+- **Active:** combine batch state with replayed and live events; publish after the live fence opens.
+- **Batch-only:** load and publish batch state after the fence opens; no per-key event is required.
+- **New:** retain streaming state, but leave batch-backed values unset until a real batch row arrives
+  or the explicit grace installs an empty baseline.
 
-### State transitions
-
-```
-┌──────────────────────────────────────────────┐
-│   First startup / cold restart                │
-│                                              │
-│   1. Iceberg scan: batch IRs → KV           │
-│   2. Kafka replay: streaming → KV           │
-│   3. Both complete → isReady = true          │
-│   4. Orchestrator routes traffic             │
-└──────────────────────────────────────────────┘
-
-┌──────────────────────────────────────────────┐
-│   Checkpoint restore (normal)                 │
-│                                              │
-│   1. Restore state from checkpoint           │
-│   2. Resume Kafka from checkpointed offsets  │
-│   3. Iceberg re-scan for batch updates       │
-│   4. isReady = true immediately              │
-└──────────────────────────────────────────────┘
-```
-
-## Entity Scenario Matrix
-
-Each entity falls into one of these categories. The matrix traces through startup, steady state,
-and edge cases for each, showing which code paths fire and what gets emitted.
-
-### Entity types
-
-| Type | Description | Has batch IR? | Has Kafka events? |
-|------|-------------|---------------|-------------------|
-| **A: Active** | In batch table AND streaming topic | Yes | Yes |
-| **B: Inactive** | In batch table, no recent events | Yes | No |
-| **C: New** | Not in batch yet, has streaming events | No | Yes |
-
-### Startup (first deploy or cold restart)
-
-| Entity | Iceberg scan | Kafka replay | First emit | Fully correct at |
-|--------|-------------|-------------|------------|------------------|
-| **A** | batch IR loaded → `currentDayStart` init'd from `batchEnd` → `runningLargeIr` computed → emit batch-only vector | Events replay from `batchEnd` → `onEvent` merges into `runningLargeIr` → emit on each event | On batch IR load (Iceberg) | Watermark caught up (~minutes) |
-| **B** | batch IR loaded → same as A → emit batch-only vector | No events → no Kafka processing | On batch IR load (Iceberg) | Immediately (batch is the full answer) |
-| **C** | No row in Iceberg → no `onBatchUpdate` | Events arrive → `batchIr = null` → `onEvent` emits streaming-only vector | On first Kafka event | Next batch run picks it up |
-
-### Steady state (job running, daily batch refresh)
-
-| Entity | On event | On eviction | On batch refresh |
-|--------|----------|-------------|------------------|
-| **A** | Update tiles + `cachedSmallWindowIr` + `largeTodayIr` + `runningLargeIr` → emit | Rebuild small windows from tiles. Recompute `runningLargeIr` from batch hops + streaming → emit | Store new `batchIr`. Recompute `runningLargeIr`. Emit on mismatch. |
-| **B** | No events → nothing | Timer fires (registered by `onBatchUpdate`). Recompute `runningLargeIr` from batch hops → emit if tail shifted. | Store new `batchIr`. Recompute. Emit on mismatch. |
-| **C** | Same as A but `batchIr = null` → `runningLargeIr` = streaming only → emit | Rebuild small windows. `batchIr = null` → `runningLargeIr` = streaming only → emit | **Transition to type A:** `batchIr` goes null→value. Recompute includes batch. Mismatch → emit. |
-
-### Day transition (advanceWatermark crosses midnight)
-
-| Entity | What happens |
-|--------|-------------|
-| **A** | `largeYesterdayIr = largeTodayIr`, `largeTodayIr = init`, `currentDayStart` advances. `runningLargeIr` NOT reset (cumulative). Eviction corrects tail within one interval. |
-| **B** | `advanceWatermark` fires from global watermark advancement. Same rotation. No events → `largeTodayIr` stays init. Eviction timer recomputes `runningLargeIr` with shifted tail hops. |
-| **C** | Same as A but no batch component. Rotation is streaming-only. |
+Daily state remains keyed by day and is pruned once covered by batch or outside every finite window.
 
 ### Batch refresh (onBatchUpdate) edge cases
 
@@ -581,16 +516,16 @@ and edge cases for each, showing which code paths fire and what gets emitted.
 |----------|-------|----------|
 | `newBatchEnd <= oldBatchEnd` | Early return | Skip (same or older batch) |
 | `currentDayStart < 0` (uninitialized, no events) | Init `currentDayStart = newBatchEnd` | Safe: no events → no overlap. Recompute and emit. |
-| `newBatchEnd > currentDayStart` (watermark lag) | Defer (return) | Store `batchIr` but don't recompute. Next eviction handles it after watermark advances. |
-| `newBatchEnd >= currentDayStart` (normal) | Clear `largeYesterdayIr` | Batch covers through yesterday. Recompute without yesterday. |
-| `newBatchEnd < currentDayStart` (stale batch catch-up) | Keep `largeYesterdayIr` | Batch doesn't cover yesterday. Include yesterday in recomputation. |
+| `newBatchEnd > currentDayStart` (batch ahead of the materialized horizon) | Defer (return) | Store `batchIr` but don't recompute. The next callback retries after the selected horizon advances. |
+| `newBatchEnd <= currentDayStart` (normal) | Prune slots with `dayStart < batchEndDay` | Recompute from the new batch plus uncovered daily slots. |
+| Stale batch catch-up | Retain slots at or after `batchEndDay` | Uncovered streaming days remain in the recomputed running view. |
 
 ### Eviction edge cases
 
 | Scenario | Behavior |
 |----------|----------|
-| `batchIr = null` (new entity, type C) | `runningLargeIr = init + streaming`. No NPE. |
-| `batchIr != null` (types A, B) | `runningLargeIr = clone(collapsed) + mergeTailHops + streaming` |
+| `batchIr = null` (new entity, type C) | Retain streaming state, but keep batch-backed output unset unless the explicit grace is active. |
+| `batchIr != null` (types A, B) | Rebuild `runningLargeIr` from batch collapsed/tail hops plus retained daily slots. |
 | `earliestTileStart = MaxValue` (no tiles, large-windows-only) | Skip tile eviction. Still recompute `runningLargeIr` from batch hops. |
 | Batch-only entity (type B), no `hasSmallWindows` | Timer registered unconditionally by `onBatchUpdate`. Eviction fires at `minEvictionInterval`. |
 

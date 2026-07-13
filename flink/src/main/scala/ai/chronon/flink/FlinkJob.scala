@@ -196,7 +196,8 @@ abstract class BaseFlinkJob {
       sinkFn: RichAsyncFunction[AvroCodecOutput, WriteResponse],
       kvStoreCapacity: Int,
       enableDebug: Boolean,
-      bufferingOutputTimeMillis: Long
+      bufferingOutputTimeMillis: Long,
+      firstSeenKeyGraceMillis: Long
   ): DataStream[WriteResponse] = {
     val eventKeySelector = KeySelectorBuilder.build(groupByServingInfoParsed.groupBy)
     val batchKeySelector = new org.apache.flink.api.java.functions.KeySelector[BatchIrRow, java.util.List[Any]] {
@@ -206,11 +207,13 @@ abstract class BaseFlinkJob {
     val gigaTileDS = preparedStream
       .connect(batchIrStream)
       .keyBy(eventKeySelector, batchKeySelector)
-      .process(
-        new GigaTileProcessFunction(groupByServingInfoParsed.groupBy,
-                                    schema,
-                                    enableDebug = enableDebug,
-                                    bufferingOutputTimeMillis = bufferingOutputTimeMillis))
+      .process(new GigaTileProcessFunction(
+        groupByServingInfoParsed.groupBy,
+        schema,
+        enableDebug = enableDebug,
+        bufferingOutputTimeMillis = bufferingOutputTimeMillis,
+        firstSeenKeyGraceMillis = firstSeenKeyGraceMillis
+      ))
       .uid(s"giga-tiling-$groupByName")
       .name(s"Giga Tiling for $groupByName")
       .setParallelism(parallelism)

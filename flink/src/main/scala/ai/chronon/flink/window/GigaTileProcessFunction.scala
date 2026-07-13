@@ -26,6 +26,11 @@ import org.slf4j.{Logger, LoggerFactory}
 
 import scala.util.Try
 
+object GigaTileProcessFunction {
+  val FirstSeenKeyGraceMillisConfig: String = "gigatile_first_seen_key_grace_millis"
+  val DefaultFirstSeenKeyGraceMillis: Long = 0L
+}
+
 /** Flink CoProcessFunction for the GigaTile pipeline.
   *
   * Two inputs:
@@ -39,10 +44,12 @@ class GigaTileProcessFunction(
     groupBy: GroupBy,
     inputSchema: Seq[(String, DataType)],
     enableDebug: Boolean = false,
-    bufferingOutputTimeMillis: Long = 0L
+    bufferingOutputTimeMillis: Long = 0L,
+    firstSeenKeyGraceMillis: Long = GigaTileProcessFunction.DefaultFirstSeenKeyGraceMillis
 ) extends KeyedCoProcessFunction[java.util.List[Any], ProjectedEvent, BatchIrRow, TimestampedTile] {
 
   require(bufferingOutputTimeMillis >= 0L, "GigaTile output buffer must be non-negative")
+  require(firstSeenKeyGraceMillis >= 0L, "GigaTile first-seen key grace must be non-negative")
 
   @transient lazy val logger: Logger = LoggerFactory.getLogger(getClass)
 
@@ -55,6 +62,9 @@ class GigaTileProcessFunction(
   @transient private var batchUpdateCounter: Counter = _
   @transient private var futureEventDropCounter: Counter = _
   @transient private var lastKey: java.util.List[Any] = _
+  // Deliberately operator-local and not checkpointed. Recovery starts a fresh delay on its first
+  // keyed callback before an unseen batch row can be treated as empty history.
+  @transient private var emptyBatchBaselineSafeAfterMillis: java.lang.Long = _
 
   private val valueColumns: Array[String] = inputSchema.map(_._1).toArray
   private val timeColumnAlias: String = Constants.TimeColumn
@@ -78,6 +88,9 @@ class GigaTileProcessFunction(
   private var pendingPublicationActivationTimerState: ValueState[java.lang.Long] = _
   private var bufferedWriteLatestTsState: ValueState[java.lang.Long] = _
   private var nextBufferedWriteTimerState: ValueState[java.lang.Long] = _
+  private var pendingEmptyBatchBaselineState: ValueState[java.lang.Boolean] = _
+  private var syntheticEmptyBatchBaselineState: ValueState[java.lang.Boolean] = _
+  private var syntheticRollbackCorrectionState: ValueState[java.lang.Boolean] = _
 
   private val publicationRetryDelayMillis = math.max(1L, 2L * FlinkJob.AutoWatermarkInterval)
   private val activationCooldownDelayMillis =
@@ -132,6 +145,13 @@ class GigaTileProcessFunction(
       new ValueStateDescriptor[java.lang.Long]("giga-tile-buffered-write-latest-ts", classOf[java.lang.Long]))
     nextBufferedWriteTimerState = getRuntimeContext.getState(
       new ValueStateDescriptor[java.lang.Long]("giga-tile-next-emit-pt-timer", classOf[java.lang.Long]))
+    pendingEmptyBatchBaselineState = getRuntimeContext.getState(
+      new ValueStateDescriptor[java.lang.Boolean]("giga-tile-pending-empty-batch", classOf[java.lang.Boolean]))
+    syntheticEmptyBatchBaselineState = getRuntimeContext.getState(
+      new ValueStateDescriptor[java.lang.Boolean]("giga-tile-synthetic-empty-batch", classOf[java.lang.Boolean]))
+    syntheticRollbackCorrectionState = getRuntimeContext.getState(
+      new ValueStateDescriptor[java.lang.Boolean]("giga-tile-synthetic-rollback-correction",
+                                                  classOf[java.lang.Boolean]))
 
     initializeTransients()
   }
@@ -163,7 +183,8 @@ class GigaTileProcessFunction(
         batchEndTsState,
         runningLargeIrState,
         cachedSmallWindowAsOfTsState,
-        lastLargeRecomputeAsOfTsState
+        lastLargeRecomputeAsOfTsState,
+        syntheticEmptyBatchBaselineState
       )
     }
   }
@@ -173,6 +194,65 @@ class GigaTileProcessFunction(
                               eventTimeWatermark,
                               FlinkJob.AllowedOutOfOrderness.toMillis,
                               FlinkJob.LiveWatermarkLagToleranceMillis)
+
+  private def firstSeenKeyGraceEnabled: Boolean = firstSeenKeyGraceMillis > 0L
+
+  private def startEmptyBatchGrace(currentProcessingTime: Long): Unit = {
+    if (!firstSeenKeyGraceEnabled) {
+      // Synthetic availability lives outside the legacy batch-IR descriptor so both a config
+      // rollback and an older binary return to the normal null fence. Keep the legacy pending
+      // publication marker armed so the next callback retracts any synthetic value already
+      // handed to KV.
+      emptyBatchBaselineSafeAfterMillis = null
+      pendingEmptyBatchBaselineState.clear()
+      flinkStore.clearSyntheticBatchIr()
+      syntheticRollbackCorrectionState.clear()
+    } else if (emptyBatchBaselineSafeAfterMillis == null) {
+      // A pre-fallback binary understands pendingPublicationState but not the two synthetic
+      // markers. If it cleared pending state, it already handed off the null-fenced correction;
+      // do not resurrect synthetic availability when rolling forward again. The correction
+      // marker may itself be clear when the rollback checkpoint captured a newer fenced update.
+      if (flinkStore.hasSyntheticBatchIr && !hasRawPendingPublication) {
+        flinkStore.clearSyntheticBatchIr()
+        syntheticRollbackCorrectionState.clear()
+      }
+      emptyBatchBaselineSafeAfterMillis =
+        if (currentProcessingTime > Long.MaxValue - firstSeenKeyGraceMillis) Long.MaxValue
+        else currentProcessingTime + firstSeenKeyGraceMillis
+    }
+  }
+
+  private def hasPendingEmptyBatchBaseline: Boolean =
+    firstSeenKeyGraceEnabled && java.lang.Boolean.TRUE.equals(pendingEmptyBatchBaselineState.value())
+
+  private def markEmptyBatchBaselinePendingIfNeeded(): Unit = {
+    if (firstSeenKeyGraceEnabled && processor.hasBatchBackedColumns && flinkStore.getBatchIr == null) {
+      pendingEmptyBatchBaselineState.update(java.lang.Boolean.TRUE)
+    }
+  }
+
+  private def initializeEmptyBatchBaselineIfReady(
+      currentProcessingTime: Long,
+      largeWindowAsOfMillis: Long
+  ): Option[GigaEmitResult] = {
+    if (!firstSeenKeyGraceEnabled) {
+      pendingEmptyBatchBaselineState.clear()
+      return None
+    }
+
+    val safeAfterMillis = emptyBatchBaselineSafeAfterMillis
+    if (
+      !hasPendingEmptyBatchBaseline || safeAfterMillis == null ||
+      currentProcessingTime < safeAfterMillis.longValue()
+    ) {
+      None
+    } else {
+      val result = processor.initializeEmptyBatchIr(largeWindowAsOfMillis,
+                                                    emptyBatchIr => flinkStore.putSyntheticBatchIr(emptyBatchIr))
+      pendingEmptyBatchBaselineState.clear()
+      if (result.finalizedVector != null) Some(result) else None
+    }
+  }
 
   private def bufferingEnabled: Boolean = bufferingOutputTimeMillis > 0L
 
@@ -191,7 +271,7 @@ class GigaTileProcessFunction(
     ) {
       // An older binary can consume a cadence timer without understanding these keyed
       // markers. Recreate logical/physical ownership on the first later callback.
-      pendingPublicationState.update(java.lang.Boolean.TRUE)
+      markPublicationPending()
       nextBufferedWriteTimestamp(lastKey, currentProcessingTime) match {
         case Some(nextEmit) =>
           // Register the replacement before moving the keyed marker. If registration
@@ -252,8 +332,32 @@ class GigaTileProcessFunction(
   private def isFutureEvent(eventTime: Long, currentProcessingTime: Long): Boolean =
     eventTime > currentProcessingTime
 
+  private def hasRawPendingPublication: Boolean =
+    java.lang.Boolean.TRUE.equals(pendingPublicationState.value())
+
+  private def hasSyntheticRollbackCorrection: Boolean =
+    java.lang.Boolean.TRUE.equals(syntheticRollbackCorrectionState.value())
+
   private def hasPendingPublication: Boolean =
-    java.lang.Boolean.TRUE.equals(pendingPublicationState.value()) && pendingVersionCollisionState.value() == null
+    hasRawPendingPublication && !hasSyntheticRollbackCorrection && pendingVersionCollisionState.value() == null
+
+  private def markPublicationPending(): Unit = {
+    syntheticRollbackCorrectionState.clear()
+    pendingPublicationState.update(java.lang.Boolean.TRUE)
+  }
+
+  private def completePublicationHandoff(): Unit = {
+    if (flinkStore.hasSyntheticBatchIr) {
+      // A marker-blind binary still understands pendingPublicationState. Keeping that legacy
+      // marker armed lets its next eligible callback hand off the null-fenced rollback value.
+      // Rollback must remain serving-fenced until that correction is verified.
+      pendingPublicationState.update(java.lang.Boolean.TRUE)
+      syntheticRollbackCorrectionState.update(java.lang.Boolean.TRUE)
+    } else {
+      pendingPublicationState.clear()
+      syntheticRollbackCorrectionState.clear()
+    }
+  }
 
   private def hasDeferredPublication: Boolean =
     hasPendingPublication &&
@@ -462,7 +566,7 @@ class GigaTileProcessFunction(
     if (!shouldPublish(mode, horizons, currentProcessingTime)) {
       val publicationPending = result.finalizedVector != null || result.needsEvictionTimer || hasPendingPublication
       if (publicationPending) {
-        pendingPublicationState.update(java.lang.Boolean.TRUE)
+        markPublicationPending()
         if (scheduleWatermarkRetry) schedulePublicationRetryIfNeeded(timerService, currentProcessingTime)
       }
       return
@@ -477,13 +581,13 @@ class GigaTileProcessFunction(
       // This tracks ownership through cadence buffering, encoding, and Collector handoff. The
       // downstream async KV result is outside this keyed operator and cannot acknowledge or
       // retry through this state.
-      pendingPublicationState.update(java.lang.Boolean.TRUE)
+      markPublicationPending()
       try {
         emitOrBuffer(finalizedVector, currentKey, currentProcessingTime, startProcessingTime, timerService, out)
         // A buffered value has not reached the collector yet. Keep the legacy pending
         // marker until cadence/collision publication succeeds so an older binary restored
         // from this checkpoint can rebuild it on the normal eviction timer.
-        if (!hasBufferedWrite && pendingVersionCollisionState.value() == null) pendingPublicationState.clear()
+        if (!hasBufferedWrite && pendingVersionCollisionState.value() == null) completePublicationHandoff()
         // Cadence or collision state owns any deferred write from here.
         clearPublicationWakeupMarkers()
       } catch {
@@ -683,7 +787,7 @@ class GigaTileProcessFunction(
       // cannot schedule and publish the same value again.
       bufferedWriteLatestTsState.clear()
       nextBufferedWriteTimerState.clear()
-      pendingPublicationState.clear()
+      completePublicationHandoff()
       clearPublicationWakeupMarkers()
     } catch {
       case e: Exception =>
@@ -698,7 +802,7 @@ class GigaTileProcessFunction(
   private def parkBufferedWrite(): Unit = {
     nextBufferedWriteTimerState.clear()
     if (hasBufferedWrite) {
-      pendingPublicationState.update(java.lang.Boolean.TRUE)
+      markPublicationPending()
     }
   }
 
@@ -712,7 +816,7 @@ class GigaTileProcessFunction(
     nextBufferedWriteTimerState.clear()
     if (bufferedVersion == null) return
 
-    pendingPublicationState.update(java.lang.Boolean.TRUE)
+    markPublicationPending()
     try {
       emitOrCoalesceVersionCollision(timerService,
                                      processor.packAndFinalize(),
@@ -721,7 +825,7 @@ class GigaTileProcessFunction(
                                      System.currentTimeMillis(),
                                      out)
       bufferedWriteLatestTsState.clear()
-      if (pendingVersionCollisionState.value() == null) pendingPublicationState.clear()
+      if (pendingVersionCollisionState.value() == null) completePublicationHandoff()
       clearPublicationWakeupMarkers()
     } catch {
       case e: Exception =>
@@ -751,6 +855,7 @@ class GigaTileProcessFunction(
       ensureStateBound(ctx.getCurrentKey)
       val timerService = ctx.timerService()
       val currentProcessingTime = timerService.currentProcessingTime()
+      startEmptyBatchGrace(currentProcessingTime)
       repairExpiredProcessingTimerMarkers(timerService, currentProcessingTime, None)
       repairStaleBufferedWriteTimerIfNeeded(timerService, currentProcessingTime, None)
       if (isFutureEvent(tsMills, currentProcessingTime)) {
@@ -758,6 +863,7 @@ class GigaTileProcessFunction(
         return
       }
       clearExpiredPublicationRetryMarker(currentProcessingTime, None)
+      markEmptyBatchBaselinePendingIfNeeded()
       val eventTimeWatermark = timerService.currentWatermark()
       val mode = currentClockMode(currentProcessingTime, eventTimeWatermark)
       val horizons = ChrononClockMode.streamEventHorizons(mode,
@@ -774,7 +880,13 @@ class GigaTileProcessFunction(
                                           tsMills,
                                           largeWindowAsOfTs = horizons.largeWindowAsOfMillis,
                                           smallWindowAsOfTs = horizons.smallWindowAsOfMillis)
-      val result = preferLatestResult(eventResult, pendingRebuild.getOrElse(rolloverResult))
+      val callbackResult = preferLatestResult(eventResult, pendingRebuild.getOrElse(rolloverResult))
+      val result =
+        if (mode == NoWatermark) callbackResult
+        else
+          initializeEmptyBatchBaselineIfReady(currentProcessingTime, horizons.largeWindowAsOfMillis)
+            .map(preferLatestResult(_, callbackResult))
+            .getOrElse(callbackResult)
 
       scheduleProcessingEvictionTimerIfNeeded(timerService, currentProcessingTime)
       emitOrDefer(mode,
@@ -806,6 +918,7 @@ class GigaTileProcessFunction(
       ensureStateBound(ctx.getCurrentKey)
       val timerService = ctx.timerService()
       val currentProcessingTime = timerService.currentProcessingTime()
+      startEmptyBatchGrace(currentProcessingTime)
       repairExpiredProcessingTimerMarkers(timerService, currentProcessingTime, None)
       repairStaleBufferedWriteTimerIfNeeded(timerService, currentProcessingTime, None)
       clearExpiredPublicationRetryMarker(currentProcessingTime, None)
@@ -825,6 +938,10 @@ class GigaTileProcessFunction(
                                                 batchRow.batchEndTs,
                                                 largeWindowAsOfTs = horizons.largeWindowAsOfMillis,
                                                 smallWindowAsOfTs = horizons.smallWindowAsOfMillis)
+      // A real row supersedes the synthetic rollback assertion. If that assertion kept the
+      // legacy pending marker armed, let this callback publish and clear it normally.
+      syntheticRollbackCorrectionState.clear()
+      pendingEmptyBatchBaselineState.clear()
       val result = preferLatestResult(batchResult, pendingRebuild.getOrElse(rolloverResult))
 
       batchUpdateCounter.inc()
@@ -846,6 +963,7 @@ class GigaTileProcessFunction(
       case e: Exception =>
         logger.error(s"Error processing batch IR for groupBy=${groupBy.getMetaData.getName}", e)
         eventProcessingErrorCounter.inc()
+        if (firstSeenKeyGraceEnabled) throw e
     }
   }
 
@@ -871,6 +989,7 @@ class GigaTileProcessFunction(
       val currentTimerCallback = Some(ctx.timeDomain() -> timestamp)
       timerServiceOnFailure = timerService
       processingTimeOnFailure = currentProcessingTime
+      startEmptyBatchGrace(currentProcessingTime)
       repairExpiredProcessingTimerMarkers(timerService, currentProcessingTime, currentTimerCallback)
 
       // Checkpoints written by the former event-time implementation may still contain
@@ -880,6 +999,7 @@ class GigaTileProcessFunction(
         val isPublicationActivationTimer = isCurrentPublicationActivationTimer(timestamp)
         publicationActivationTimerFired = isPublicationActivationTimer
         if (isPublicationActivationTimer) pendingPublicationActivationTimerState.clear()
+        markEmptyBatchBaselinePendingIfNeeded()
         scheduleProcessingEvictionTimerIfNeeded(timerService, currentProcessingTime)
         if (isPublicationActivationTimer) {
           if (hasDeferredPublication) {
@@ -895,7 +1015,10 @@ class GigaTileProcessFunction(
                 val rolloverResult = advanceDayForMode(Live, currentProcessingTime, eventTimeWatermark)
                 val retryResult = rebuildPendingAtCurrentTime(Live, horizons, currentProcessingTime)
                   .getOrElse(GigaEmitResult(null))
-                val result = preferLatestResult(retryResult, rolloverResult)
+                val callbackResult = preferLatestResult(retryResult, rolloverResult)
+                val result = initializeEmptyBatchBaselineIfReady(currentProcessingTime, horizons.largeWindowAsOfMillis)
+                  .map(preferLatestResult(_, callbackResult))
+                  .getOrElse(callbackResult)
                 emitOrDefer(Live,
                             horizons,
                             result,
@@ -949,6 +1072,8 @@ class GigaTileProcessFunction(
         !expiredPublicationRetryMarkerCleared
       ) return
 
+      markEmptyBatchBaselinePendingIfNeeded()
+
       // The physical retry timer has fired. Clear only its logical role before running all
       // coincident roles, then arm one watermark-driven wake-up if publication remains fenced.
       if (isPublicationRetryTimer) clearPublicationRetryMarker()
@@ -968,7 +1093,7 @@ class GigaTileProcessFunction(
             // The active batch input holds the connected watermark at MIN while it scans.
             // Keep consuming records, but do not age or roll keyed state from wall clock.
             val snapshot = processor.currentSnapshot
-            if (!snapshot.isEmpty) pendingPublicationState.update(java.lang.Boolean.TRUE)
+            if (!snapshot.isEmpty) markPublicationPending()
             GigaEmitResult(null, needsEvictionTimer = snapshot.needsEvictionTimer, isEmpty = snapshot.isEmpty)
           case _ =>
             val horizons = timerHorizons.get
@@ -978,13 +1103,19 @@ class GigaTileProcessFunction(
             val evictionResult = pendingRebuild.getOrElse(
               processor.onEviction(EvictionTimes(timerTs = horizons.largeWindowAsOfMillis,
                                                  smallWindowAsOfTs = horizons.smallWindowAsOfMillis)))
-            preferLatestResult(evictionResult, rolloverResult)
+            val callbackResult = preferLatestResult(evictionResult, rolloverResult)
+            initializeEmptyBatchBaselineIfReady(currentProcessingTime, horizons.largeWindowAsOfMillis)
+              .map(preferLatestResult(_, callbackResult))
+              .getOrElse(callbackResult)
         }
         timerResult = Some(result)
 
         // Keep normal decay live while state or a deferred publication remains. A coincident
         // collision flush rearms itself on failure, so it does not need a speculative timer.
-        if (!result.isEmpty || result.needsEvictionTimer || hasPendingPublication || hasBufferedWrite) {
+        if (
+          !result.isEmpty || result.needsEvictionTimer || hasPendingPublication || hasBufferedWrite ||
+          hasPendingEmptyBatchBaseline
+        ) {
           scheduleProcessingEvictionTimerIfNeeded(timerService, currentProcessingTime)
         }
       }
@@ -1011,7 +1142,7 @@ class GigaTileProcessFunction(
         }
       }
 
-      if (hasPendingPublication) {
+      if (hasPendingPublication || hasPendingEmptyBatchBaseline) {
         scheduleProcessingEvictionTimerIfNeeded(timerService, currentProcessingTime)
       }
 
@@ -1049,10 +1180,10 @@ class GigaTileProcessFunction(
           case Some(horizons) if shouldPublish(mode, horizons, currentProcessingTime) =>
             // Eviction runs first when both markers share a timestamp, so this is one
             // post-eviction snapshot with a strictly newer version.
-            pendingPublicationState.update(java.lang.Boolean.TRUE)
+            markPublicationPending()
             flushVersionCollision(timerService, currentProcessingTime, currentTimerCallback, ctx.getCurrentKey, out)
           case _ =>
-            pendingPublicationState.update(java.lang.Boolean.TRUE)
+            markPublicationPending()
             scheduleProcessingEvictionTimerIfNeeded(timerService, currentProcessingTime)
             postponeVersionCollision(timerService, currentProcessingTime, currentTimerCallback)
         }
@@ -1167,6 +1298,7 @@ class FlinkGigaTileStore(megaTileAgg: MegaTileAggregator, codec: MegaTileCodec, 
   private var runningLargeIrState: ValueState[Array[Byte]] = _
   private var cachedSmallWindowAsOfTsState: ValueState[java.lang.Long] = _
   private var lastLargeRecomputeAsOfTsState: ValueState[java.lang.Long] = _
+  private var syntheticEmptyBatchBaselineState: ValueState[java.lang.Boolean] = _
 
   // Decode cache invalidated on key switch. Keeping per-day decoded values in an off-heap
   // mutable map would defeat the idea of per-key Flink state, so we just memoize the values
@@ -1187,7 +1319,8 @@ class FlinkGigaTileStore(megaTileAgg: MegaTileAggregator, codec: MegaTileCodec, 
                      batchEndTs: ValueState[java.lang.Long],
                      runningLarge: ValueState[Array[Byte]],
                      cachedSmallWindowAsOfTs: ValueState[java.lang.Long],
-                     lastLargeRecomputeAsOfTs: ValueState[java.lang.Long]): Unit = {
+                     lastLargeRecomputeAsOfTs: ValueState[java.lang.Long],
+                     syntheticEmptyBatchBaseline: ValueState[java.lang.Boolean]): Unit = {
     tileState = tiles
     megaTileIrState = megaTileIr
     dailyLargeIrState = dailyLargeIr
@@ -1198,6 +1331,7 @@ class FlinkGigaTileStore(megaTileAgg: MegaTileAggregator, codec: MegaTileCodec, 
     runningLargeIrState = runningLarge
     cachedSmallWindowAsOfTsState = cachedSmallWindowAsOfTs
     lastLargeRecomputeAsOfTsState = lastLargeRecomputeAsOfTs
+    syntheticEmptyBatchBaselineState = syntheticEmptyBatchBaseline
     cachedSmallValid = false
     batchIrValid = false
     runningLargeValid = false
@@ -1286,15 +1420,35 @@ class FlinkGigaTileStore(megaTileAgg: MegaTileAggregator, codec: MegaTileCodec, 
   override def getBatchIr: FinalBatchIr = {
     if (!batchIrValid) {
       val bytes = batchIrState.value()
-      batchIrDecoded = if (bytes != null) gigaCodec.decodeBatchIr(bytes) else null
+      batchIrDecoded =
+        if (bytes != null) gigaCodec.decodeBatchIr(bytes)
+        else if (java.lang.Boolean.TRUE.equals(syntheticEmptyBatchBaselineState.value()))
+          megaTileAgg.finalizeSnapshot(megaTileAgg.init)
+        else null
       batchIrValid = true
     }
     batchIrDecoded
   }
   override def putBatchIr(ir: FinalBatchIr): Unit = {
     batchIrState.update(gigaCodec.encodeBatchIr(ir))
+    syntheticEmptyBatchBaselineState.clear()
     batchIrDecoded = ir; batchIrValid = true
   }
+
+  def putSyntheticBatchIr(ir: FinalBatchIr): Unit = {
+    syntheticEmptyBatchBaselineState.update(java.lang.Boolean.TRUE)
+    batchIrDecoded = ir; batchIrValid = true
+  }
+
+  def clearSyntheticBatchIr(): Unit = {
+    if (java.lang.Boolean.TRUE.equals(syntheticEmptyBatchBaselineState.value())) {
+      syntheticEmptyBatchBaselineState.clear()
+      batchIrDecoded = null; batchIrValid = false
+    }
+  }
+
+  def hasSyntheticBatchIr: Boolean =
+    java.lang.Boolean.TRUE.equals(syntheticEmptyBatchBaselineState.value())
 
   override def getBatchEndTs: Long = Option(batchEndTsState.value()).map(_.longValue()).getOrElse(-1L)
   override def putBatchEndTs(ts: Long): Unit = batchEndTsState.update(ts)

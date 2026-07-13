@@ -8,7 +8,7 @@ import ai.chronon.flink.FlinkJob.watermarkStrategy
 import ai.chronon.flink.deser.ProjectedEvent
 import ai.chronon.flink.source.{BatchIrSourceBuilder, FlinkSource}
 import ai.chronon.flink.types.{AvroCodecOutput, WriteResponse}
-import ai.chronon.flink.window.MegaTileEmissionPolicy
+import ai.chronon.flink.window.{GigaTileProcessFunction, MegaTileEmissionPolicy}
 import ai.chronon.online.{Api, GroupByServingInfoParsed, TopicInfo}
 
 import java.util.concurrent.TimeUnit
@@ -71,6 +71,8 @@ class ChainedGroupByJob(eventSrc: FlinkSource[ProjectedEvent],
     FlinkUtils.getNonNegativeLongProperty("buffering_output_time_millis", props, topicInfo)
   private val bufferingOutputJitterMillis =
     FlinkUtils.getNonNegativeLongProperty("buffering_output_jitter_millis", props, topicInfo)
+  private val firstSeenKeyGraceMillis =
+    FlinkUtils.getNonNegativeLongProperty(GigaTileProcessFunction.FirstSeenKeyGraceMillisConfig, props, topicInfo)
   private val bufferingOutputPolicy =
     FlinkUtils
       .getProperty("buffering_output_policy", props, topicInfo)
@@ -117,7 +119,10 @@ class ChainedGroupByJob(eventSrc: FlinkSource[ProjectedEvent],
       s"Building giga tiled (push) Flink streaming job for groupBy: $groupByName that chains join: " +
         s"${joinSource.getJoin.getMetaData.getName} using topic: $topic")
     val (processedStream, schema) = buildEnrichedStream(env)
-    val batchIrStream = BatchIrSourceBuilder.build(env, groupByServingInfoParsed, props)
+    val batchIrStream = BatchIrSourceBuilder.build(env,
+                                                   groupByServingInfoParsed,
+                                                   props,
+                                                   requireConfiguredBatchSource = firstSeenKeyGraceMillis > 0L)
     buildGigaTiledTail(processedStream,
                        batchIrStream,
                        schema,
@@ -125,7 +130,8 @@ class ChainedGroupByJob(eventSrc: FlinkSource[ProjectedEvent],
                        sinkFn,
                        kvStoreCapacity,
                        enableDebug,
-                       gigaTileBufferingOutputTimeMillis)
+                       gigaTileBufferingOutputTimeMillis,
+                       firstSeenKeyGraceMillis)
   }
 
   /** Build the source → watermark → enrichment → query transform pipeline.

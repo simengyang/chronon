@@ -162,4 +162,14 @@ class AllowedLatenessConfigTest extends AnyFlatSpec with Matchers {
     FlinkUtils.gigaTileBufferingOutputTimeMillis(1000L, MegaTileEmissionPolicy.Default) shouldBe 0L
     FlinkUtils.gigaTileBufferingOutputTimeMillis(1000L, MegaTileEmissionPolicy.WallClockCadence) shouldBe 1000L
   }
+
+  "gigatile first-seen grace config" should "be opt-in for missing zero and negative values" in {
+    val key = "gigatile_first_seen_key_grace_millis"
+    val topicInfo = TopicInfo("test-topic", "kafka", Map.empty)
+
+    FlinkUtils.getNonNegativeLongProperty(key, Map.empty, topicInfo) shouldBe 0L
+    FlinkUtils.getNonNegativeLongProperty(key, Map(key -> "0"), topicInfo) shouldBe 0L
+    FlinkUtils.getNonNegativeLongProperty(key, Map(key -> "-1"), topicInfo) shouldBe 0L
+    FlinkUtils.getNonNegativeLongProperty(key, Map(key -> "3600000"), topicInfo) shouldBe 3600000L
+  }
 }

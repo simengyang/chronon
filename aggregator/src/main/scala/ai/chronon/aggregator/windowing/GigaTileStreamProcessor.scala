@@ -59,6 +59,8 @@ class GigaTileStreamProcessor(
 
   val hasSmallWindows: Boolean = smallWindowTiers.nonEmpty
 
+  val hasBatchBackedColumns: Boolean = isNoBatch.contains(false)
+
   // Eviction cadence: smallest hop across ALL windows (not just small).
   // Large-window-only GroupBys need eviction for tail hop correction.
   val minEvictionInterval: Long = megaTileAgg.activeTiers.min
@@ -411,6 +413,26 @@ class GigaTileStreamProcessor(
     } else {
       GigaEmitResult(null, needsEvictionTimer = true, isEmpty = packedIsEmpty)
     }
+  }
+
+  /** Treat a first-seen key as having no historical batch contribution.
+    *
+    * This only installs the empty baseline. It deliberately leaves batchEndTs unchanged so a
+    * later real batch row remains authoritative and retained live slots are not pruned early.
+    */
+  private[chronon] def initializeEmptyBatchIr(
+      largeWindowAsOfTs: Long,
+      installEmptyBatchIr: FinalBatchIr => Unit
+  ): GigaEmitResult = {
+    if (store.getBatchIr != null) return GigaEmitResult(null)
+
+    installEmptyBatchIr(megaTileAgg.finalizeSnapshot(megaTileAgg.init))
+    val currentDayStart = store.getCurrentDayStart
+    if (currentDayStart >= 0L) recomputeRunningLargeIr(largeWindowAsOfTs, currentDayStart)
+
+    val packed = pack()
+    val packedIsEmpty = isAllNull(packed)
+    GigaEmitResult(windowedAgg.finalize(packed), needsEvictionTimer = true, isEmpty = packedIsEmpty)
   }
 
   // --- Private helpers ---
