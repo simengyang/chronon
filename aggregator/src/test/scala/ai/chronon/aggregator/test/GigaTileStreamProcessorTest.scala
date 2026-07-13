@@ -524,11 +524,12 @@ class GigaTileStreamProcessorTest extends AnyFlatSpec {
       processor.onEvent(event, event.ts)
     }
 
-    // First eviction at an hour boundary — should emit
+    // Event-path recomputes already kept the large view current. Both forced evictions
+    // must suppress their write because recomputing produces the same packed IR.
     val evictionTs = TsUtils.round(batchEnd + 12 * 3600 * 1000L, 3600 * 1000L)
     processor.advanceWatermark(evictionTs)
     val result1 = processor.onEviction(evictionTs)
-    assertNotNull("first eviction should emit", result1.finalizedVector)
+    assertNull("an already-current eviction should not emit", result1.finalizedVector)
 
     // Second eviction 5 min later — same hour boundary, no events, nothing changed
     val nextEviction = evictionTs + 5 * 60 * 1000L
@@ -963,5 +964,452 @@ class GigaTileStreamProcessorTest extends AnyFlatSpec {
     if (!approxEqual(result.finalizedVector, naive(0))) {
       fail(s"all_small_windows: expected ${gson.toJson(naive(0))} got ${gson.toJson(result.finalizedVector)}")
     }
+  }
+
+  it should "exclude an expired small-window tile when a hop timer callback is delayed" in {
+    val schema: Seq[(String, DataType)] = Seq(("ts", LongType), ("num", LongType), ("amount", DoubleType))
+    val aggregations = Seq(Builders.Aggregation(Operation.SUM, "num", Seq(new Window(1, TimeUnit.HOURS))))
+    val megaTileAgg = new MegaTileAggregator(aggregations, schema, tailBufferMillis = TailBufferMillis)
+    val processor = new GigaTileStreamProcessor(megaTileAgg, new InMemoryGigaTileStore(megaTileAgg.windowedAggregator))
+    val hopMillis = 5 * 60 * 1000L
+    val expiredTileEventTs = 10 * hopMillis
+    val previousHopTs = expiredTileEventTs + 12 * hopMillis + 1L
+    val delayedEventTs = previousHopTs + hopMillis + 9 * 1000L
+
+    // Seed the left-edge 1h tile, then stop before the next hop eviction fires.
+    // The delayed event path must rebuild the stale cache before adding the fresh 7.
+    processor.onEvent(row(expiredTileEventTs, 5L, 1.0), expiredTileEventTs + 1L)
+    processor.onEviction(previousHopTs)
+
+    val result = processor.onEvent(row(delayedEventTs, 7L, 1.0), delayedEventTs)
+    assertEquals("expired left-edge tile must not survive a delayed hop timer", 7L, result.finalizedVector(0))
+  }
+
+  it should "rebuild a sparse small window when a timer skips multiple hops" in {
+    val schema: Seq[(String, DataType)] = Seq(("ts", LongType), ("num", LongType), ("amount", DoubleType))
+    val aggregations = Seq(Builders.Aggregation(Operation.SUM, "num", Seq(new Window(1, TimeUnit.HOURS))))
+    val megaTileAgg = new MegaTileAggregator(aggregations, schema, tailBufferMillis = TailBufferMillis)
+    val store = new InMemoryGigaTileStore(megaTileAgg.windowedAggregator)
+    val processor = new GigaTileStreamProcessor(megaTileAgg, store)
+    val hopMillis = processor.minSmallWindowTileSize
+
+    processor.onEvent(row(0L, 5L, 1.0), 0L, hopMillis + 1L)
+    assertEquals(hopMillis, store.getCachedSmallWindowAsOfTs)
+
+    // The 0-minute tile expires before this callback, but the immediately preceding
+    // hop tile is empty. The full skipped range still has to trigger a rebuild.
+    val delayedCallbackTs = 14 * hopMillis + 1L
+    val result = processor.onEviction(delayedCallbackTs)
+
+    assertNotNull("the delayed timer must publish the sparse-key correction", result.finalizedVector)
+    assertNull("the old sparse tile must not survive the skipped hops", result.finalizedVector(0))
+    assertTrue("the corrected sparse key must be empty", result.isEmpty)
+
+    // A +1 exclusive bound can cache the tile that starts exactly at the rounded marker.
+    // The bounded gap scan must include that marker tile as well.
+    val markerStore = new InMemoryGigaTileStore(megaTileAgg.windowedAggregator)
+    val markerProcessor = new GigaTileStreamProcessor(megaTileAgg, markerStore)
+    markerProcessor.onEvent(row(hopMillis, 7L, 1.0), hopMillis, hopMillis + 1L)
+    assertEquals(hopMillis, markerStore.getCachedSmallWindowAsOfTs)
+
+    val markerResult = markerProcessor.onEviction(delayedCallbackTs)
+    assertNotNull("the delayed timer must publish the exact-marker correction", markerResult.finalizedVector)
+    assertNull("the exact-marker tile must expire across the skipped hops", markerResult.finalizedVector(0))
+    assertTrue("the corrected exact-marker key must be empty", markerResult.isEmpty)
+  }
+
+  it should "exclude an expired batch tail for a large-window-only delayed callback" in {
+    val batchEnd = 10 * DayMillis
+    val hourMillis = 60 * 60 * 1000L
+    val schema: Seq[(String, DataType)] = Seq(("ts", LongType), ("num", LongType), ("amount", DoubleType))
+    val aggregations = Seq(Builders.Aggregation(Operation.SUM, "num", Seq(new Window(49, TimeUnit.HOURS))))
+    val batchEvents = Array(row(batchEnd - 48 * hourMillis, 5L, 1.0))
+    val megaTileAgg = new MegaTileAggregator(aggregations, schema, tailBufferMillis = TailBufferMillis)
+    val store = new InMemoryGigaTileStore(megaTileAgg.windowedAggregator) {
+      var runningLargeWrites: Int = 0
+
+      override def putRunningLargeIr(ir: Array[Any]): Unit = {
+        runningLargeWrites += 1
+        super.putRunningLargeIr(ir)
+      }
+    }
+    val processor = new GigaTileStreamProcessor(megaTileAgg, store)
+    val batchIr = denormalizeBatchIr(buildBatchIr(batchEvents, batchEnd, aggregations, schema),
+                                     aggregations,
+                                     schema,
+                                     batchEnd)
+    val beforeExpiry = batchEnd + 59 * 60 * 1000L
+    // Skip past the +2h boundary where the -48h tail hop leaves this 49h sawtooth.
+    val delayedCallbackTs = batchEnd + 3 * hourMillis + 60 * 1000L
+    val freshEvent = row(delayedCallbackTs - 1L, 7L, 1.0)
+
+    processor.onBatchUpdate(batchIr, batchEnd, batchEnd)
+    processor.onEviction(beforeExpiry)
+    val delayedTimerResult = processor.onEviction(delayedCallbackTs)
+    assertNull("the delayed timer must remove the expired batch tail", delayedTimerResult.finalizedVector(0))
+    assertEquals(delayedCallbackTs, store.getLastLargeRecomputeAsOfTs)
+
+    val writesBeforeDelayedCallback = store.runningLargeWrites
+    val result = processor.onEvent(freshEvent,
+                                   freshEvent.ts,
+                                   largeWindowAsOfTs = delayedCallbackTs,
+                                   smallWindowAsOfTs = delayedCallbackTs)
+
+    assertEquals("the expired batch tail must be removed before adding the fresh event",
+                 7L,
+                 result.finalizedVector(0))
+    assertEquals("the event must reuse the timer-corrected horizon and then apply once",
+                 writesBeforeDelayedCallback + 1,
+                 store.runningLargeWrites)
+    assertEquals(delayedCallbackTs, store.getLastLargeRecomputeAsOfTs)
+
+    val writesAfterRebuild = store.runningLargeWrites
+    val sameHopCallbackTs = delayedCallbackTs + 30 * 60 * 1000L
+    val sameHopEvent = row(sameHopCallbackTs - 1L, 3L, 1.0)
+    val sameHopResult = processor.onEvent(sameHopEvent,
+                                         sameHopEvent.ts,
+                                         largeWindowAsOfTs = sameHopCallbackTs,
+                                         smallWindowAsOfTs = sameHopCallbackTs)
+
+    assertEquals(10L, sameHopResult.finalizedVector(0))
+    assertEquals("a second event in the same large-window hop must not rebuild again",
+                 writesAfterRebuild + 1,
+                 store.runningLargeWrites)
+    assertEquals("the last recompute marker must remain at the first callback in the hop",
+                 delayedCallbackTs,
+                 store.getLastLargeRecomputeAsOfTs)
+  }
+
+  it should "rebuild at an offset tail boundary inside one eviction hop" in {
+    val batchEnd = 10 * DayMillis
+    val hourMillis = 60 * 60 * 1000L
+    val schema: Seq[(String, DataType)] = Seq(("ts", LongType), ("num", LongType), ("amount", DoubleType))
+    val window = new Window(49 * 60 + 20, TimeUnit.MINUTES)
+    val aggregations = Seq(Builders.Aggregation(Operation.SUM, "num", Seq(window)))
+    val batchEvents = Array(row(batchEnd - 48 * hourMillis, 5L, 1.0))
+    val megaTileAgg = new MegaTileAggregator(aggregations, schema, tailBufferMillis = TailBufferMillis)
+    val store = new InMemoryGigaTileStore(megaTileAgg.windowedAggregator) {
+      var runningLargeWrites: Int = 0
+
+      override def putRunningLargeIr(ir: Array[Any]): Unit = {
+        runningLargeWrites += 1
+        super.putRunningLargeIr(ir)
+      }
+    }
+    val processor = new GigaTileStreamProcessor(megaTileAgg, store)
+    val batchIr = denormalizeBatchIr(buildBatchIr(batchEvents, batchEnd, aggregations, schema),
+                                     aggregations,
+                                     schema,
+                                     batchEnd)
+    val beforeOffsetBoundary = batchEnd + 2 * hourMillis + 5 * 60 * 1000L
+    val afterOffsetBoundary = batchEnd + 2 * hourMillis + 30 * 60 * 1000L
+
+    processor.onBatchUpdate(batchIr, batchEnd, batchEnd)
+    processor.onEviction(beforeOffsetBoundary)
+    assertEquals(5L, processor.currentSnapshot.finalizedVector(0))
+
+    val writesBeforeEvent = store.runningLargeWrites
+    val result = processor.onEvent(row(afterOffsetBoundary - 1L, 7L, 1.0),
+                                   afterOffsetBoundary - 1L,
+                                   largeWindowAsOfTs = afterOffsetBoundary,
+                                   smallWindowAsOfTs = afterOffsetBoundary)
+
+    assertEquals("the tail that expired at +2h20 must be removed before the event", 7L, result.finalizedVector(0))
+    assertEquals("the callback must rebuild once and then apply the event",
+                 writesBeforeEvent + 2,
+                 store.runningLargeWrites)
+    assertEquals(afterOffsetBoundary, store.getLastLargeRecomputeAsOfTs)
+  }
+
+  it should "rebuild at an offset daily-slot boundary inside one eviction hop" in {
+    val hourMillis = 60 * 60 * 1000L
+    val schema: Seq[(String, DataType)] = Seq(("ts", LongType), ("num", LongType), ("amount", DoubleType))
+    val window = new Window(49 * 60 + 20, TimeUnit.MINUTES)
+    val aggregations = Seq(Builders.Aggregation(Operation.SUM, "num", Seq(window)))
+    val megaTileAgg = new MegaTileAggregator(aggregations, schema, tailBufferMillis = TailBufferMillis)
+    val store = new InMemoryGigaTileStore(megaTileAgg.windowedAggregator)
+    val processor = new GigaTileStreamProcessor(megaTileAgg, store)
+    val emptyBatch = denormalizeBatchIr(buildBatchIr(Array.empty[TestRow], 0L, aggregations, schema),
+                                        aggregations,
+                                        schema,
+                                        0L)
+    val oldEventTs = hourMillis
+    val beforeOffsetBoundary = 3 * DayMillis + hourMillis + 5 * 60 * 1000L
+    val afterOffsetBoundary = 3 * DayMillis + hourMillis + 30 * 60 * 1000L
+
+    processor.onBatchUpdate(emptyBatch, 0L, 0L)
+    processor.onEvent(row(oldEventTs, 5L, 1.0), oldEventTs)
+    processor.onEviction(beforeOffsetBoundary)
+    assertEquals(5L, processor.currentSnapshot.finalizedVector(0))
+
+    val result = processor.onEvent(row(afterOffsetBoundary - 1L, 7L, 1.0),
+                                   afterOffsetBoundary - 1L,
+                                   largeWindowAsOfTs = afterOffsetBoundary,
+                                   smallWindowAsOfTs = afterOffsetBoundary)
+
+    assertEquals("the expired day slot must be removed before the fresh event", 7L, result.finalizedVector(0))
+    assertEquals(afterOffsetBoundary, store.getLastLargeRecomputeAsOfTs)
+  }
+
+  it should "keep an out-of-order daily slot out of an expired shorter window" in {
+    val schema: Seq[(String, DataType)] = Seq(("ts", LongType), ("num", LongType), ("amount", DoubleType))
+    val aggregations = Seq(
+      Builders.Aggregation(Operation.SUM,
+                           "num",
+                           Seq(new Window(3, TimeUnit.DAYS), new Window(7, TimeUnit.DAYS))))
+    val megaTileAgg = new MegaTileAggregator(aggregations, schema, tailBufferMillis = TailBufferMillis)
+    val processor = new GigaTileStreamProcessor(megaTileAgg, new InMemoryGigaTileStore(megaTileAgg.windowedAggregator))
+    val materializedAsOfTs = 10 * DayMillis
+    val oldEventTs = 4 * DayMillis + 60 * 60 * 1000L
+    val emptyBatch = denormalizeBatchIr(buildBatchIr(Array.empty[TestRow], 0L, aggregations, schema),
+                                        aggregations,
+                                        schema,
+                                        0L)
+
+    processor.onBatchUpdate(emptyBatch, 0L, 0L)
+    processor.advanceWatermark(materializedAsOfTs)
+    val result = processor.onEvent(row(oldEventTs, 5L, 1.0),
+                                   oldEventTs,
+                                   largeWindowAsOfTs = oldEventTs,
+                                   smallWindowAsOfTs = oldEventTs)
+
+    assertNull("the old slot must not re-inflate the already-expired 3d window", result.finalizedVector(0))
+    assertEquals("the same slot remains eligible for the 7d window", 5L, result.finalizedVector(1))
+    assertEquals(materializedAsOfTs, processor.store.getLastLargeRecomputeAsOfTs)
+  }
+
+  it should "keep a deferred future batch inactive until its day" in {
+    val schema: Seq[(String, DataType)] = Seq(("ts", LongType), ("num", LongType), ("amount", DoubleType))
+    val aggregations = Seq(Builders.Aggregation(Operation.SUM, "num", Seq(new Window(7, TimeUnit.DAYS))))
+    val megaTileAgg = new MegaTileAggregator(aggregations, schema, tailBufferMillis = TailBufferMillis)
+    val processor = new GigaTileStreamProcessor(megaTileAgg, new InMemoryGigaTileStore(megaTileAgg.windowedAggregator))
+    val futureBatchEnd = 2 * DayMillis
+    val oldBatch = denormalizeBatchIr(
+      buildBatchIr(Array(row(-60 * 60 * 1000L, 5L, 1.0)), 0L, aggregations, schema),
+      aggregations,
+      schema,
+      0L)
+    val futureBatch = denormalizeBatchIr(
+      buildBatchIr(Array(row(futureBatchEnd - 60 * 60 * 1000L, 50L, 1.0)),
+                   futureBatchEnd,
+                   aggregations,
+                   schema),
+      aggregations,
+      schema,
+      futureBatchEnd)
+
+    processor.onBatchUpdate(oldBatch, 0L, 0L)
+    val deferred = processor.onBatchUpdate(futureBatch,
+                                           futureBatchEnd,
+                                           largeWindowAsOfTs = DayMillis,
+                                           smallWindowAsOfTs = DayMillis)
+    assertNull(deferred.finalizedVector)
+
+    val beforeActivation = processor.onEvent(row(DayMillis + 60 * 60 * 1000L, 7L, 1.0),
+                                             DayMillis + 60 * 60 * 1000L)
+    assertEquals("the event path must retain the prior large view", 12L, beforeActivation.finalizedVector(0))
+    assertNull(processor.onEviction(DayMillis + 2 * 60 * 60 * 1000L).finalizedVector)
+    processor.advanceWatermark(DayMillis + 2 * 60 * 60 * 1000L)
+    assertEquals(12L, processor.currentSnapshot.finalizedVector(0))
+
+    processor.advanceWatermark(futureBatchEnd + 60 * 60 * 1000L)
+    assertEquals("the deferred batch becomes active only once its day is current",
+                 50L,
+                 processor.currentSnapshot.finalizedVector(0))
+  }
+
+  it should "keep eviction live for an empty view with a deferred future batch" in {
+    val schema: Seq[(String, DataType)] = Seq(("ts", LongType), ("num", LongType), ("amount", DoubleType))
+    val aggregations = Seq(Builders.Aggregation(Operation.SUM, "num", Seq(new Window(7, TimeUnit.DAYS))))
+    val megaTileAgg = new MegaTileAggregator(aggregations, schema, tailBufferMillis = TailBufferMillis)
+    val processor = new GigaTileStreamProcessor(megaTileAgg, new InMemoryGigaTileStore(megaTileAgg.windowedAggregator))
+    val currentBatchEnd = 10 * DayMillis
+    val futureBatchEnd = currentBatchEnd + DayMillis
+    val emptyBatch = denormalizeBatchIr(buildBatchIr(Array.empty[TestRow], currentBatchEnd, aggregations, schema),
+                                        aggregations,
+                                        schema,
+                                        currentBatchEnd)
+    val futureBatch = denormalizeBatchIr(
+      buildBatchIr(Array(row(futureBatchEnd - 60 * 60 * 1000L, 50L, 1.0)),
+                   futureBatchEnd,
+                   aggregations,
+                   schema),
+      aggregations,
+      schema,
+      futureBatchEnd)
+
+    processor.onBatchUpdate(emptyBatch,
+                            currentBatchEnd,
+                            largeWindowAsOfTs = currentBatchEnd,
+                            smallWindowAsOfTs = currentBatchEnd)
+    processor.onBatchUpdate(futureBatch,
+                            futureBatchEnd,
+                            largeWindowAsOfTs = currentBatchEnd + 60 * 60 * 1000L,
+                            smallWindowAsOfTs = currentBatchEnd + 60 * 60 * 1000L)
+
+    val waiting = processor.onEviction(currentBatchEnd + 2 * 60 * 60 * 1000L)
+    assertNull(waiting.finalizedVector)
+    assertTrue("the empty key must retain a timer until its future batch activates", waiting.needsEvictionTimer)
+    assertTrue(waiting.isEmpty)
+
+    val activated = processor.advanceWatermark(futureBatchEnd + 60 * 60 * 1000L)
+    assertEquals(50L, activated.finalizedVector(0))
+  }
+
+  it should "not rewind the cached small-window horizon for an older event" in {
+    val schema: Seq[(String, DataType)] = Seq(("ts", LongType), ("num", LongType), ("amount", DoubleType))
+    val aggregations = Seq(Builders.Aggregation(Operation.SUM, "num", Seq(new Window(1, TimeUnit.HOURS))))
+    val megaTileAgg = new MegaTileAggregator(aggregations, schema, tailBufferMillis = TailBufferMillis)
+    val store = new InMemoryGigaTileStore(megaTileAgg.windowedAggregator)
+    val processor = new GigaTileStreamProcessor(megaTileAgg, store)
+    val hopMillis = 5 * 60 * 1000L
+    val expiredEventTs = 0L
+    val liveAsOfTs = 13 * hopMillis + 1L
+
+    processor.onEvent(row(expiredEventTs, 5L, 1.0), expiredEventTs + 1L)
+    val eviction = processor.onEviction(liveAsOfTs)
+    assertNull("the original tile must be expired at the live horizon", eviction.finalizedVector(0))
+
+    val result = processor.onEvent(row(expiredEventTs, 7L, 1.0), expiredEventTs)
+    assertNull("an older event must not resurrect the expired tile", result.finalizedVector(0))
+    assertEquals("the cache marker must not move backwards", 13 * hopMillis, store.getCachedSmallWindowAsOfTs)
+  }
+
+  it should "surface a cache-only correction from an adjacent day rollover" in {
+    val schema: Seq[(String, DataType)] = Seq(("ts", LongType), ("num", LongType), ("amount", DoubleType))
+    val aggregations = Seq(Builders.Aggregation(Operation.SUM, "num", Seq(new Window(1, TimeUnit.HOURS))))
+    val megaTileAgg = new MegaTileAggregator(aggregations, schema, tailBufferMillis = TailBufferMillis)
+    val processor = new GigaTileStreamProcessor(megaTileAgg, new InMemoryGigaTileStore(megaTileAgg.windowedAggregator))
+    val eventTs = DayMillis - 90 * 60 * 1000L
+
+    processor.onEvent(row(eventTs, 5L, 1.0), eventTs + 1L)
+    val rollover = processor.advanceWatermark(DayMillis + 60 * 1000L)
+
+    assertNotNull("the rollover correction must be publishable", rollover.finalizedVector)
+    assertNull("the event must expire from the 1h window", rollover.finalizedVector(0))
+    assertTrue("the corrected vector must be marked empty", rollover.isEmpty)
+  }
+
+  it should "publish a stale-cache correction when a delayed event is fully dropped" in {
+    val schema: Seq[(String, DataType)] = Seq(("ts", LongType), ("num", LongType), ("amount", DoubleType))
+    val aggregations =
+      Seq(Builders.Aggregation(Operation.SUM, "num", Seq(new Window(1, TimeUnit.HOURS), new Window(7, TimeUnit.DAYS))))
+    val megaTileAgg = new MegaTileAggregator(aggregations, schema, tailBufferMillis = TailBufferMillis)
+    val processor = new GigaTileStreamProcessor(megaTileAgg, new InMemoryGigaTileStore(megaTileAgg.windowedAggregator))
+    val hopMillis = 5 * 60 * 1000L
+    val baseDay = 40 * DayMillis
+    val oldLargeWindowEventTs = baseDay - 8 * DayMillis + 60 * 60 * 1000L
+    val expiredTileEventTs = baseDay + 10 * hopMillis
+    val delayedProcessingTs = expiredTileEventTs + 13 * hopMillis + 9 * 1000L
+    val droppedEventTs = baseDay - 33 * DayMillis
+    val emptyBatchIr =
+      denormalizeBatchIr(buildBatchIr(Array.empty[TestRow], 0L, aggregations, schema), aggregations, schema, 0L)
+
+    // Keep a 7d value live while the 1h tile expires, then trigger the stale-cache rebuild
+    // with an event so old that it is dropped. The rebuild still changed the PUSH value.
+    processor.onBatchUpdate(emptyBatchIr, 0L, 0L)
+    processor.advanceWatermark(baseDay)
+    processor.onEvent(row(oldLargeWindowEventTs, 5L, 1.0), oldLargeWindowEventTs)
+    processor.onEvent(row(expiredTileEventTs, 11L, 1.0), expiredTileEventTs + 1L)
+
+    val result = processor.onEvent(row(droppedEventTs, 7L, 1.0), droppedEventTs, delayedProcessingTs)
+    assertTrue("event outside the retained daily range must be reported as dropped", result.droppedStaleEvent)
+    assertNotNull("stale-cache correction must publish even when the triggering event is dropped",
+                  result.finalizedVector)
+    assertNull("expired left-edge tile must not survive a fully dropped delayed event", result.finalizedVector(0))
+    assertEquals("the correction must also expire the stale large-window tail", 11L, result.finalizedVector(1))
+  }
+
+  it should "retain an exact-hop event when a delayed scheduled eviction rebuilds the cache" in {
+    val schema: Seq[(String, DataType)] = Seq(("ts", LongType), ("num", LongType), ("amount", DoubleType))
+    val aggregations = Seq(Builders.Aggregation(Operation.SUM, "num", Seq(new Window(1, TimeUnit.HOURS))))
+    val megaTileAgg = new MegaTileAggregator(aggregations, schema, tailBufferMillis = TailBufferMillis)
+    val processor = new GigaTileStreamProcessor(megaTileAgg, new InMemoryGigaTileStore(megaTileAgg.windowedAggregator))
+    val hopMillis = 5 * 60 * 1000L
+    val exactHopTs = 20 * hopMillis
+    val expiredBufferTileTs = exactHopTs - 13 * hopMillis
+
+    processor.onEvent(row(expiredBufferTileTs, 3L, 1.0), expiredBufferTileTs + 1L)
+    processor.onEvent(row(exactHopTs - 1L, 0L, 1.0), exactHopTs - 1L, exactHopTs + 1L)
+    processor.onEvent(row(exactHopTs, 5L, 1.0), exactHopTs, exactHopTs + 1L)
+
+    val result = processor.onEviction(EvictionTimes(timerTs = exactHopTs, smallWindowAsOfTs = exactHopTs + 1L))
+    assertNotNull("the scheduled boundary rebuild should emit", result.finalizedVector)
+    assertEquals("the just-opened exact-hop tile must remain visible", 5L, result.finalizedVector(0))
+  }
+
+  it should "rebuild mixed small and large state across a day rollover" in {
+    val schema: Seq[(String, DataType)] = Seq(("ts", LongType), ("num", LongType), ("amount", DoubleType))
+    val aggregations =
+      Seq(Builders.Aggregation(Operation.SUM, "num", Seq(new Window(1, TimeUnit.HOURS), new Window(7, TimeUnit.DAYS))))
+    val megaTileAgg = new MegaTileAggregator(aggregations, schema, tailBufferMillis = TailBufferMillis)
+    val processor = new GigaTileStreamProcessor(megaTileAgg, new InMemoryGigaTileStore(megaTileAgg.windowedAggregator))
+    val rolloverDay = 10 * DayMillis
+    val beforeRollover = rolloverDay - 60 * 1000L
+    val afterRollover = rolloverDay + 60 * 1000L
+    val oldLargeEventTs = rolloverDay - 8 * DayMillis + 60 * 60 * 1000L
+    val recentEventTs = rolloverDay - 30 * 60 * 1000L
+    val emptyBatchIr =
+      denormalizeBatchIr(buildBatchIr(Array.empty[TestRow], 0L, aggregations, schema), aggregations, schema, 0L)
+
+    processor.onBatchUpdate(emptyBatchIr, 0L, 0L)
+    processor.advanceWatermark(beforeRollover)
+    processor.onEvent(row(oldLargeEventTs, 5L, 1.0), oldLargeEventTs, beforeRollover)
+    processor.onEvent(row(recentEventTs, 7L, 1.0), recentEventTs, beforeRollover)
+
+    val rollover = processor.advanceWatermark(afterRollover)
+    assertNotNull("the mixed-window correction must be publishable", rollover.finalizedVector)
+    assertEquals("the recent value remains in the 1h window", 7L, rollover.finalizedVector(0))
+    assertEquals("the expired daily slot must leave the 7d window", 7L, rollover.finalizedVector(1))
+  }
+
+  it should "keep the large-window horizon separate from the small-window boundary" in {
+    val schema: Seq[(String, DataType)] = Seq(("ts", LongType), ("num", LongType), ("amount", DoubleType))
+    val aggregations =
+      Seq(Builders.Aggregation(Operation.SUM, "num", Seq(new Window(1, TimeUnit.HOURS), new Window(7, TimeUnit.DAYS))))
+    val megaTileAgg = new MegaTileAggregator(aggregations, schema, tailBufferMillis = TailBufferMillis)
+    val processor = new GigaTileStreamProcessor(megaTileAgg, new InMemoryGigaTileStore(megaTileAgg.windowedAggregator))
+    val baseDay = 40 * DayMillis
+    val largeWindowAsOfTs = baseDay + 7 * DayMillis
+    val smallWindowAsOfTs = largeWindowAsOfTs + DayMillis
+    val oldLargeEventTs = baseDay + 60 * 60 * 1000L
+    val recentEventTs = largeWindowAsOfTs - 30 * 60 * 1000L
+    val droppedEventTs = largeWindowAsOfTs - 33 * DayMillis
+    val emptyBatchIr =
+      denormalizeBatchIr(buildBatchIr(Array.empty[TestRow], 0L, aggregations, schema), aggregations, schema, 0L)
+
+    processor.onBatchUpdate(emptyBatchIr, 0L, 0L)
+    processor.advanceWatermark(largeWindowAsOfTs)
+    processor.onEvent(row(oldLargeEventTs, 5L, 1.0), oldLargeEventTs, largeWindowAsOfTs)
+    processor.onEvent(row(recentEventTs, 11L, 1.0), recentEventTs, largeWindowAsOfTs)
+
+    val result = processor.onEvent(row(droppedEventTs, 7L, 1.0),
+                                   droppedEventTs,
+                                   largeWindowAsOfTs = largeWindowAsOfTs,
+                                   smallWindowAsOfTs = smallWindowAsOfTs)
+    assertTrue("the trigger must be outside retained history", result.droppedStaleEvent)
+    assertNull("the small horizon should expire both streaming tiles", result.finalizedVector(0))
+    assertEquals("the large horizon must retain both 7d contributions", 16L, result.finalizedVector(1))
+  }
+
+  it should "rebuild stale small state when a batch row is the next callback" in {
+    val schema: Seq[(String, DataType)] = Seq(("ts", LongType), ("num", LongType), ("amount", DoubleType))
+    val aggregations = Seq(Builders.Aggregation(Operation.SUM, "num", Seq(new Window(1, TimeUnit.HOURS))))
+    val megaTileAgg = new MegaTileAggregator(aggregations, schema, tailBufferMillis = TailBufferMillis)
+    val processor = new GigaTileStreamProcessor(megaTileAgg, new InMemoryGigaTileStore(megaTileAgg.windowedAggregator))
+    val eventTs = 4 * DayMillis + 60 * 60 * 1000L
+    val batchCallbackTs = eventTs + 2 * 60 * 60 * 1000L
+    val emptyBatchIr =
+      denormalizeBatchIr(buildBatchIr(Array.empty[TestRow], 0L, aggregations, schema), aggregations, schema, 0L)
+
+    processor.onEvent(row(eventTs, 5L, 1.0), eventTs, eventTs + 1L)
+    val result = processor.onBatchUpdate(emptyBatchIr,
+                                         newBatchEnd = 0L,
+                                         largeWindowAsOfTs = batchCallbackTs,
+                                         smallWindowAsOfTs = batchCallbackTs)
+
+    assertNotNull("the batch callback must surface the stale-cache correction", result.finalizedVector)
+    assertNull("the expired 1h value must not remain published", result.finalizedVector(0))
+    assertTrue("the correction is an encoded all-null value", result.isEmpty)
   }
 }

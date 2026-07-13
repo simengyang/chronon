@@ -5,6 +5,8 @@ import ai.chronon.api.TsUtils
 
 import scala.collection.mutable
 
+private[chronon] final case class EvictionTimes(timerTs: Long, smallWindowAsOfTs: Long)
+
 /** Pure Scala state manager for the GigaTile streaming pipeline.
   *
   * Flink holds the FinalBatchIr in state (loaded from Iceberg) and one daily large-window
@@ -39,6 +41,11 @@ class GigaTileStreamProcessor(
   private val baseAgg = megaTileAgg.baseAggregator
   private val isNoBatch = megaTileAgg.isNoBatch
   private val columnHopSize = megaTileAgg.columnHopSize
+  private val isFiniteLargeWindow: Array[Boolean] = megaTileAgg.windowMappings.zipWithIndex.map { case (mapping, col) =>
+    val window = mapping.aggregationPart.window
+    !isNoBatch(col) && window != null && window.length > 0 && window.length < Int.MaxValue
+  }
+  private val hasFiniteLargeWindows = isFiniteLargeWindow.contains(true)
 
   val smallWindowTiers: Set[Long] = {
     val tiers = mutable.Set.empty[Long]
@@ -93,7 +100,18 @@ class GigaTileStreamProcessor(
     * rebuild correctly), but only events inside each column's effective horizon contribute
     * to the live cached IR that gets emitted.
     */
-  def onEvent(row: Row, eventTs: Long, smallWindowAsOfTs: Long): GigaEmitResult = {
+  def onEvent(row: Row, eventTs: Long, smallWindowAsOfTs: Long): GigaEmitResult =
+    onEvent(row, eventTs, largeWindowAsOfTs = smallWindowAsOfTs, smallWindowAsOfTs = smallWindowAsOfTs)
+
+  /** Separate horizons keep the small-window exclusive upper bound from shifting the
+    * large-window query time at an exact hop boundary.
+    */
+  private[chronon] def onEvent(
+      row: Row,
+      eventTs: Long,
+      largeWindowAsOfTs: Long,
+      smallWindowAsOfTs: Long
+  ): GigaEmitResult = {
     var currentDayStart = store.getCurrentDayStart
     if (currentDayStart == -1L) {
       currentDayStart = TsUtils.round(eventTs, DayMillis)
@@ -105,6 +123,19 @@ class GigaTileStreamProcessor(
     // --- Small windows: update tiles, then update cached IR only for columns whose
     // tile lies inside the smallWindowAsOfTs horizon. ---
     if (hasSmallWindows) {
+      val targetHop = TsUtils.round(smallWindowAsOfTs, minSmallWindowTileSize)
+      val cachedHop = store.getCachedSmallWindowAsOfTs
+      // An older or delayed callback can arrive after this cache has advanced. Keep the live
+      // horizon monotonic instead of rebuilding or gating the event against an older range
+      // and resurrecting an expired tile.
+      val effectiveSmallWindowAsOfTs = if (cachedHop > targetHop) cachedHop else smallWindowAsOfTs
+      // A delayed callback can advance to a new hop before the scheduled eviction runs.
+      // Rebuild first so this event cannot publish an expired tile from the previous hop.
+      if (store.getEarliestTileStart != Long.MaxValue && cachedHop < targetHop) {
+        rebuildCachedSmallWindowIr(smallWindowAsOfTs, currentDayStart)
+        dirty = true
+      }
+
       val acceptedTileStarts = mutable.Map.empty[Long, Long]
       val tileStarts = megaTileAgg.tileStartsForEvent(eventTs)
       for ((hopSize, tileStart) <- tileStarts) {
@@ -131,10 +162,10 @@ class GigaTileStreamProcessor(
           if (isNoBatch(col)) {
             val hopSize = columnHopSize(col)
             acceptedTileStarts.get(hopSize).foreach { tileStart =>
-              val effStart = megaTileAgg.effectiveStart(col, smallWindowAsOfTs, currentDayStart)
+              val effStart = megaTileAgg.effectiveStart(col, effectiveSmallWindowAsOfTs, currentDayStart)
               // Retained late events: keep the base tile but skip cached-IR update so the live
               // emit reflects only events inside the as-of horizon for this column's window.
-              if (tileStart >= effStart && tileStart < smallWindowAsOfTs) {
+              if (tileStart >= effStart && tileStart < effectiveSmallWindowAsOfTs) {
                 if (cachedIr == null) cachedIr = store.getCachedSmallWindowIr
                 windowedAgg.columnAggregators(col).update(cachedIr, row)
                 cachedIrUpdated = true
@@ -145,17 +176,22 @@ class GigaTileStreamProcessor(
         }
         if (cachedIrUpdated) {
           store.putCachedSmallWindowIr(cachedIr)
+          store.putCachedSmallWindowAsOfTs(math.max(cachedHop, targetHop))
           dirty = true
         }
       }
     }
 
+    // A delayed callback can cross one or more large-window boundaries before its
+    // scheduled eviction runs. Track the last full recompute per key so the event path
+    // repairs a stale large view once per hop without coupling it to the small horizon.
+    if (recomputeRunningLargeIrForEventIfNeeded(largeWindowAsOfTs, currentDayStart)) dirty = true
+
     // --- Large windows: route to the per-day slot for round(eventTs, DayMillis) ---
-    // Accept events as far back as the staleness bound. Events whose dayStart is already
-    // covered by batch are still accepted for the incremental running IR (so onEvent emits
-    // see them immediately), and recomputeRunningLargeIr will drop their daily slot at the
-    // next eviction — matching the original "incremental shows it, eviction may drop it"
-    // trade-off when the late event was not in the prior batch's source data.
+    // Accept events as far back as the staleness bound. The daily slot retains the event for
+    // every large column, but the incremental running view only updates columns whose daily
+    // slot overlaps the monotonic materialized horizon. This prevents an out-of-order event
+    // from resurrecting an already-expired shorter window before the next eviction.
     //
     // Daily slot IRs are sized to the BASE aggregator (one column per (op, input)) — not
     // the windowed aggregator. The same SUM(num) value covers every windowed SUM(num, W)
@@ -171,7 +207,11 @@ class GigaTileStreamProcessor(
       store.putDailyLargeIr(eventDayStart, dayIr)
 
       val runningIr = store.getRunningLargeIr
-      updateLargeWindowColumns(runningIr, row)
+      val lastLargeRecomputeAsOfTs = store.getLastLargeRecomputeAsOfTs
+      val effectiveLargeAsOfTs =
+        if (lastLargeRecomputeAsOfTs == Long.MinValue) largeWindowAsOfTs
+        else math.max(lastLargeRecomputeAsOfTs, largeWindowAsOfTs)
+      updateLargeWindowColumns(runningIr, row, eventDayStart, effectiveLargeAsOfTs)
       store.putRunningLargeIr(runningIr)
       dirty = true
     } else {
@@ -182,25 +222,23 @@ class GigaTileStreamProcessor(
     else GigaEmitResult(null, droppedStaleEvent = droppedStaleEvent)
   }
 
-  /** As-of-driven day transition. Updates currentDayStart and rebuilds the small-window
-    * cache because each column's effectiveStart shifts with the new as-of horizon. Daily
-    * large-IR slots are unaffected — they're keyed by day-start and persist across rollovers
-    * until batch covers them.
+  /** As-of-driven day transition. Finite day jumps rebuild both views so the next callback
+    * cannot combine a corrected small-window cache with stale large-window state.
     */
   def advanceWatermark(watermarkTs: Long): GigaEmitResult = {
     val currentDayStart = store.getCurrentDayStart
     if (currentDayStart == -1L) return GigaEmitResult(null)
     val wmDay = TsUtils.round(watermarkTs, DayMillis)
     if (wmDay > currentDayStart) {
-      val isAdjacentRollover = wmDay == currentDayStart + DayMillis
+      val previousPackedIr = windowedAgg.clone(pack())
       store.putCurrentDayStart(wmDay)
-      // Rebuild only on an adjacent-day transition. Multi-day jumps and end-of-stream
-      // (watermark = MAX) push the as-of so far past retained tiles that everything would be
-      // marked stale and the cache cleared — emitting a spurious null that would overwrite the
-      // PUSH KV row. Leave those cases to the next eviction at a sane timer timestamp.
-      if (isAdjacentRollover && hasSmallWindows) {
-        val previousPackedIr = windowedAgg.clone(pack())
+      // A terminal MAX watermark is not a serving horizon. Rebuilding at MAX would expire
+      // every retained value and publish a synthetic all-null row when a bounded input ends.
+      if (watermarkTs != Long.MaxValue) {
         rebuildCachedSmallWindowIr(watermarkTs, wmDay)
+        // A future batch row is retained but must not become active until its boundary.
+        // Small-window time can still advance while the prior large view remains serving.
+        if (!largeRecomputeDeferred(wmDay)) recomputeRunningLargeIr(watermarkTs, wmDay)
         val packed = pack()
         val packedIsEmpty = isAllNull(packed)
         val previousWasEmpty = isAllNull(previousPackedIr)
@@ -209,33 +247,35 @@ class GigaTileStreamProcessor(
         }
       }
     }
-    GigaEmitResult(null)
+    GigaEmitResult(null, isEmpty = isAllNull(pack()))
   }
 
   /** Direct eviction/serve-as-of: corrects small window sawtooth and large window tail selection. */
   def onEviction(timerTs: Long): GigaEmitResult =
-    runEviction(timerTs, force = true)
+    onEviction(EvictionTimes(timerTs = timerTs, smallWindowAsOfTs = timerTs))
 
-  /** Scheduled eviction used by Flink timers. Timer cadence stays fixed, but a timer that does
-    * not cross a real small or large boundary skips the expensive state rebuilds.
-    */
-  def onScheduledEviction(timerTs: Long): GigaEmitResult =
-    runEviction(timerTs, force = false)
-
-  private def runEviction(timerTs: Long, force: Boolean): GigaEmitResult = {
+  private[chronon] def onEviction(evictionTimes: EvictionTimes): GigaEmitResult = {
     val currentDayStart = store.getCurrentDayStart
     if (currentDayStart == -1L) return GigaEmitResult(null)
 
-    val smallMayChange = force || smallWindowMayChangeAt(timerTs, currentDayStart)
-    val largeMayChange = force || largeIrMayChangeAt(timerTs)
+    val cachedSmallWindowHop = store.getCachedSmallWindowAsOfTs
+    val requestedSmallWindowHop = TsUtils.round(evictionTimes.smallWindowAsOfTs, minSmallWindowTileSize)
+    val cachedSmallWindowHopUnknown = cachedSmallWindowHop < 0L
+    val smallWindowCanAdvance = hasSmallWindows &&
+      (cachedSmallWindowHopUnknown || requestedSmallWindowHop >= cachedSmallWindowHop)
+    val smallMayChange = smallWindowCanAdvance
+    val largeRecomputeIsDeferred = largeRecomputeDeferred(currentDayStart)
+    val largeMayChange = !largeRecomputeIsDeferred
     if (!smallMayChange && !largeMayChange) {
-      return GigaEmitResult(null, isEmpty = isAllNull(pack()))
+      // Do not advance the large recompute marker. A later callback checks the entire gap
+      // from the last materialized horizon, including boundaries skipped by delayed timers.
+      return GigaEmitResult(null, needsEvictionTimer = largeRecomputeIsDeferred, isEmpty = isAllNull(pack()))
     }
 
     val previousPackedIr = windowedAgg.clone(pack())
 
-    if (smallMayChange) rebuildCachedSmallWindowIr(timerTs, currentDayStart)
-    if (largeMayChange) recomputeRunningLargeIr(timerTs, currentDayStart)
+    if (smallMayChange) rebuildCachedSmallWindowIr(evictionTimes.smallWindowAsOfTs, currentDayStart)
+    if (largeMayChange) recomputeRunningLargeIr(evictionTimes.timerTs, currentDayStart)
 
     val packed = pack()
     val packedIsEmpty = isAllNull(packed)
@@ -243,9 +283,11 @@ class GigaTileStreamProcessor(
     if ((packedIsEmpty && previousWasEmpty) || irEqual(previousPackedIr, packed)) {
       // Nothing changed for this key. Suppress redundant KV writes, including fully-decayed
       // idle entities where the previous and current packed IR are both all-null.
-      GigaEmitResult(null, isEmpty = packedIsEmpty)
+      GigaEmitResult(null, needsEvictionTimer = largeRecomputeIsDeferred, isEmpty = packedIsEmpty)
     } else {
-      GigaEmitResult(windowedAgg.finalize(packed), isEmpty = packedIsEmpty)
+      GigaEmitResult(windowedAgg.finalize(packed),
+                     needsEvictionTimer = largeRecomputeIsDeferred,
+                     isEmpty = packedIsEmpty)
     }
   }
 
@@ -296,7 +338,7 @@ class GigaTileStreamProcessor(
   }
 
   /** True when every column in the packed pre-finalize IR is null. Used by the eviction
-    * suppress path and surfaced on GigaEmitResult so the Flink writer can DELETE the KV row.
+    * suppress path and surfaced so Flink can stop scheduling further decay callbacks.
     */
   private def isAllNull(packed: Array[Any]): Boolean = {
     var i = 0
@@ -313,10 +355,19 @@ class GigaTileStreamProcessor(
     * @param newBatchEnd batch upload boundary timestamp (midnight-aligned)
     * @param currentWatermark Flink's current watermark (for tail hop selection as queryTs)
     */
-  def onBatchUpdate(newBatchIr: FinalBatchIr, newBatchEnd: Long, currentWatermark: Long): GigaEmitResult = {
+  def onBatchUpdate(newBatchIr: FinalBatchIr, newBatchEnd: Long, currentWatermark: Long): GigaEmitResult =
+    onBatchUpdate(newBatchIr, newBatchEnd, largeWindowAsOfTs = currentWatermark, smallWindowAsOfTs = currentWatermark)
+
+  private[chronon] def onBatchUpdate(
+      newBatchIr: FinalBatchIr,
+      newBatchEnd: Long,
+      largeWindowAsOfTs: Long,
+      smallWindowAsOfTs: Long
+  ): GigaEmitResult = {
     val oldBatchEnd = store.getBatchEndTs
     if (newBatchEnd <= oldBatchEnd) return GigaEmitResult(null)
 
+    val previousPackedIr = windowedAgg.clone(pack())
     val strippedBatchIr = stripSmallWindowHops(newBatchIr)
     store.putBatchIr(strippedBatchIr)
     store.putBatchEndTs(newBatchEnd)
@@ -330,7 +381,8 @@ class GigaTileStreamProcessor(
         store.putCurrentDayStart(currentDayStart)
       } else {
         // Defer until watermark advances past batchEnd. Daily slots between currentDayStart
-        // and batchEnd would otherwise overlap with batch and double-count.
+        // and batchEnd would otherwise overlap with batch and double-count. Event, timer, and
+        // day-roll recomputation paths all honor largeRecomputeDeferred.
         return GigaEmitResult(null, needsEvictionTimer = true)
       }
     }
@@ -346,116 +398,53 @@ class GigaTileStreamProcessor(
     }
     toRemove.foreach(store.removeDailyLargeIr)
 
-    val oldRunningIr = store.getRunningLargeIr
-    recomputeRunningLargeIr(currentWatermark, currentDayStart)
+    rebuildCachedSmallWindowIr(smallWindowAsOfTs, currentDayStart)
+    recomputeRunningLargeIr(largeWindowAsOfTs, currentDayStart)
+    val packed = pack()
+    val packedIsEmpty = isAllNull(packed)
 
-    val newRunningIr = store.getRunningLargeIr
-
-    if (!irEqual(oldRunningIr, newRunningIr)) {
-      GigaEmitResult(packAndFinalize(), needsEvictionTimer = true)
+    if (!irEqual(previousPackedIr, packed)) {
+      GigaEmitResult(windowedAgg.finalize(packed), needsEvictionTimer = true, isEmpty = packedIsEmpty)
     } else {
-      GigaEmitResult(null, needsEvictionTimer = true)
+      GigaEmitResult(null, needsEvictionTimer = true, isEmpty = packedIsEmpty)
     }
   }
 
   // --- Private helpers ---
 
-  private def previousTimerTs(queryTs: Long): Long =
-    if (queryTs <= Long.MinValue + minEvictionInterval) Long.MinValue else queryTs - minEvictionInterval
+  private def recomputeRunningLargeIrForEventIfNeeded(queryTs: Long, currentDayStart: Long): Boolean = {
+    if (!hasFiniteLargeWindows || largeRecomputeDeferred(currentDayStart)) return false
 
-  private def crossedSincePreviousTimer(queryTs: Long, boundaryTs: Long): Boolean =
-    boundaryTs > previousTimerTs(queryTs) && boundaryTs <= queryTs
-
-  private def smallWindowMayChangeAt(queryTs: Long, currentDayStart: Long): Boolean = {
-    if (!hasSmallWindows || store.getEarliestTileStart == Long.MaxValue) return false
-
-    var col = 0
-    while (col < windowedAgg.length) {
-      val windowMillis = megaTileAgg.columnWindowMillis(col)
-      if (isNoBatch(col) && windowMillis > 0) {
-        val hopSize = columnHopSize(col)
-        val effectiveStart = megaTileAgg.effectiveStart(col, queryTs, currentDayStart)
-        if (effectiveStart >= Long.MinValue + hopSize) {
-          val expiredTileStart = effectiveStart - hopSize
-          if (store.getTile(hopSize, expiredTileStart) != null) return true
-        }
-      }
-      col += 1
+    if (largeIrMayChangeSinceLastRecompute(queryTs)) {
+      recomputeRunningLargeIr(queryTs, currentDayStart)
+      true
+    } else {
+      false
     }
-
-    false
   }
 
-  private def largeIrMayChangeAt(queryTs: Long): Boolean = {
-    val batchIr = store.getBatchIr
-    val batchEndTs = store.getBatchEndTs
-    val batchEndDay = if (batchEndTs > 0) TsUtils.round(batchEndTs, DayMillis) else Long.MinValue
+  private def largeRecomputeDeferred(currentDayStart: Long): Boolean =
+    currentDayStart >= 0L && store.getBatchEndTs > currentDayStart
 
-    if (batchEndDay != Long.MinValue) {
-      val iter = store.dailyLargeIrIterator
-      while (iter.hasNext) {
-        val (dayStart, _) = iter.next()
-        if (dayStart < batchEndDay) return true
-      }
-    }
+  /** True when a finite large-window start crossed its own tail-hop boundary since the exact
+    * prior materialized horizon. Batch ends and daily slots are midnight-aligned, and every
+    * tail hop divides a day, so the same boundary covers collapsed, tail, and daily expiry.
+    * This stays O(columns) on the event path; iterating retained daily state here would decode
+    * every slot for every event until the next real boundary.
+    */
+  private def largeIrMayChangeSinceLastRecompute(queryTs: Long): Boolean = {
+    val previousAsOfTs = store.getLastLargeRecomputeAsOfTs
+    if (previousAsOfTs == Long.MinValue) return true
+    if (queryTs <= previousAsOfTs) return false
 
-    if (batchIr != null && batchEndTs > 0L) {
-      var col = 0
-      while (col < windowedAgg.length) {
-        val windowMillis = megaTileAgg.columnWindowMillis(col)
-        if (!isNoBatch(col) && windowMillis > 0) {
-          val collapsedExpiry = addIfNoOverflow(batchEndTs, windowMillis)
-          if (
-            batchIr.collapsed != null && col < batchIr.collapsed.length &&
-            batchIr.collapsed(col) != null && crossedSincePreviousTimer(queryTs, collapsedExpiry)
-          ) {
-            return true
-          }
-
-          val hopIndex = megaTileAgg.tailHopIndicesArray(col)
-          if (batchIr.tailHops != null && hopIndex < batchIr.tailHops.length && batchIr.tailHops(hopIndex) != null) {
-            val hopSize = megaTileAgg.hopSizesArray(hopIndex)
-            val prevTs = previousTimerTs(queryTs)
-            val previousTail =
-              if (prevTs == Long.MinValue) Long.MinValue
-              else TsUtils.round(subtractIfNoUnderflow(prevTs, windowMillis), hopSize)
-            val queryTail = TsUtils.round(subtractIfNoUnderflow(queryTs, windowMillis), hopSize)
-            if (queryTail > previousTail) {
-              val baseIrIndex = megaTileAgg.baseIrIndicesArray(col)
-              val hopIrs = batchIr.tailHops(hopIndex)
-              var idx = 0
-              while (idx < hopIrs.length) {
-                val hopIr = hopIrs(idx)
-                if (hopIr != null && baseIrIndex < hopIr.length - 1) {
-                  val hopStart = hopIr.last.asInstanceOf[Long]
-                  if (hopStart >= previousTail && hopStart < queryTail && hopIr(baseIrIndex) != null) {
-                    return true
-                  }
-                }
-                idx += 1
-              }
-            }
-          }
-        }
-        col += 1
-      }
-    }
-
-    val columnWindowMillis = megaTileAgg.columnWindowMillis
-    val baseIrIndices = megaTileAgg.baseIrIndicesArray
     var col = 0
     while (col < windowedAgg.length) {
-      val windowMillis = columnWindowMillis(col)
-      if (!isNoBatch(col) && windowMillis > 0 && queryTs >= windowMillis + DayMillis) {
-        val dayStart = TsUtils.round(queryTs - windowMillis - DayMillis, DayMillis)
-        val expiryTs = addIfNoOverflow(addIfNoOverflow(dayStart, DayMillis), windowMillis)
-        if (crossedSincePreviousTimer(queryTs, expiryTs)) {
-          val dayIr = store.getDailyLargeIr(dayStart)
-          val baseIrIndex = baseIrIndices(col)
-          if (dayIr != null && baseIrIndex < dayIr.length && dayIr(baseIrIndex) != null) {
-            return true
-          }
-        }
+      if (isFiniteLargeWindow(col)) {
+        val windowMillis = megaTileAgg.columnWindowMillis(col)
+        val hopSize = columnHopSize(col)
+        val previousStart = TsUtils.round(subtractIfNoUnderflow(previousAsOfTs, windowMillis), hopSize)
+        val queryStart = TsUtils.round(subtractIfNoUnderflow(queryTs, windowMillis), hopSize)
+        if (queryStart > previousStart) return true
       }
       col += 1
     }
@@ -493,7 +482,7 @@ class GigaTileStreamProcessor(
     // windowed column via baseIrIndices, but only for columns whose own window overlaps the
     // slot's date range. Otherwise we'd over-count smaller-window columns by an entire day's
     // worth of out-of-window events.
-    val batchEndDay = if (batchEndTs > 0) TsUtils.round(batchEndTs, DayMillis) else Long.MinValue
+    val batchEndDay = if (batchEndTs >= 0L) TsUtils.round(batchEndTs, DayMillis) else Long.MinValue
     val maxWindowMillis = megaTileAgg.maxWindowMillis
     val columnWindowMillis = megaTileAgg.columnWindowMillis
     val baseIrIndices = megaTileAgg.baseIrIndicesArray
@@ -534,11 +523,12 @@ class GigaTileStreamProcessor(
     // aliased to cached tail-hop or daily-slot IRs; subsequent in-place onEvent updates would
     // then mutate that shared state and corrupt future serves.
     store.putRunningLargeIr(windowedAgg.clone(runningIr))
+    store.putLastLargeRecomputeAsOfTs(queryTs)
   }
 
   /** Rebuild cachedSmallWindowIr from retained tiles using the supplied as-of horizon.
-    * Called from advanceWatermark on day rollover (effective starts shift) and from
-    * onEviction (sawtooth correction at hop boundaries).
+    * Used for day-roll and hop-boundary correction, and before event publication whenever
+    * the cached as-of marker is stale.
     */
   private def rebuildCachedSmallWindowIr(asOfTs: Long, currentDayStart: Long): Unit = {
     if (!hasSmallWindows) return
@@ -569,13 +559,23 @@ class GigaTileStreamProcessor(
 
     val rebuiltIr = megaTileAgg.buildMegaTileIr(tiles, now = asOfTs, batchEnd = currentDayStart)
     store.putCachedSmallWindowIr(rebuiltIr)
+    store.putCachedSmallWindowAsOfTs(TsUtils.round(asOfTs, minSmallWindowTileSize))
   }
 
-  private def updateLargeWindowColumns(ir: Array[Any], row: Row): Unit = {
+  private def updateLargeWindowColumns(
+      ir: Array[Any],
+      row: Row,
+      eventDayStart: Long,
+      effectiveAsOfTs: Long
+  ): Unit = {
+    val slotEnd = addIfNoOverflow(eventDayStart, DayMillis)
     var col = 0
     while (col < windowedAgg.length) {
       if (!isNoBatch(col)) {
-        windowedAgg.columnAggregators(col).update(ir, row)
+        val include =
+          !isFiniteLargeWindow(col) ||
+            slotEnd > subtractIfNoUnderflow(effectiveAsOfTs, megaTileAgg.columnWindowMillis(col))
+        if (include) windowedAgg.columnAggregators(col).update(ir, row)
       }
       col += 1
     }
@@ -626,13 +626,11 @@ class GigaTileStreamProcessor(
 
 case class GigaEmitResult(
     finalizedVector: Array[Any],
-    // True when a non-timer path, such as batch update, wants the next fixed-cadence
-    // eviction timer registered.
+    // True when this key must keep its fixed-cadence eviction timer registered. Batch
+    // updates start the cadence; deferred future batches keep it live even for empty keys.
     needsEvictionTimer: Boolean = false,
-    // True when the packed pre-finalize IR has every column null. The Flink wiring uses this
-    // to (a) DELETE the PUSH KV row instead of writing a row of nulls and (b) decide whether
-    // to keep re-registering decay timers — once a key is fully empty, no further decay is
-    // possible until a new event arrives.
+    // True when the packed pre-finalize IR has every column null. Flink can emit the encoded
+    // all-null correction and stop decay timers; the current sink does not issue a DELETE.
     isEmpty: Boolean = false,
     // True when this onEvent call dropped its event because eventTs was older than the
     // staleness bound. Surfaced so the Flink wiring can bump a metric / log instead of

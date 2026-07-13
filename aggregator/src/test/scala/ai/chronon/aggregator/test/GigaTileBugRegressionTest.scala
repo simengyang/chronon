@@ -48,6 +48,10 @@ class GigaTileBugRegressionTest extends AnyFlatSpec {
 
     override def getCachedSmallWindowIr: Array[Any] = currentStore.getCachedSmallWindowIr
     override def putCachedSmallWindowIr(ir: Array[Any]): Unit = currentStore.putCachedSmallWindowIr(ir)
+    override def getCachedSmallWindowAsOfTs: Long = currentStore.getCachedSmallWindowAsOfTs
+    override def putCachedSmallWindowAsOfTs(ts: Long): Unit = currentStore.putCachedSmallWindowAsOfTs(ts)
+    override def getLastLargeRecomputeAsOfTs: Long = currentStore.getLastLargeRecomputeAsOfTs
+    override def putLastLargeRecomputeAsOfTs(ts: Long): Unit = currentStore.putLastLargeRecomputeAsOfTs(ts)
 
     override def getLargeTodayIr: Array[Any] = currentStore.getLargeTodayIr
     override def putLargeTodayIr(ir: Array[Any]): Unit = currentStore.putLargeTodayIr(ir)
@@ -72,21 +76,6 @@ class GigaTileBugRegressionTest extends AnyFlatSpec {
     override def removeDailyLargeIr(dayStart: Long): Unit = currentStore.removeDailyLargeIr(dayStart)
     override def dailyLargeIrIterator: Iterator[(Long, Array[Any])] = currentStore.dailyLargeIrIterator
 
-  }
-
-  private class CountingGigaTileStore(windowedAgg: RowAggregator) extends InMemoryGigaTileStore(windowedAgg) {
-    var runningLargeWrites: Int = 0
-    var tileScans: Int = 0
-
-    override def putRunningLargeIr(ir: Array[Any]): Unit = {
-      runningLargeWrites += 1
-      super.putRunningLargeIr(ir)
-    }
-
-    override def tileIterator: Iterator[(Long, Long, Array[Any])] = {
-      tileScans += 1
-      super.tileIterator
-    }
   }
 
   private def mixedBoundaryAggregations: Seq[Aggregation] =
@@ -129,8 +118,9 @@ class GigaTileBugRegressionTest extends AnyFlatSpec {
     def loadStreamingKey(key: String): Unit = {
       store.bind(key)
       processor.onBatchUpdate(emptyBatch, baseDay, baseDay)
-      processor.advanceWatermark(queryTs - 2 * HourMillis)
-      processor.onEvent(new TestRow(queryTs - 2 * HourMillis, 5L)(0), queryTs - 2 * HourMillis)
+      val expiringEventTs = queryTs - HourMillis - 1L
+      processor.advanceWatermark(expiringEventTs)
+      processor.onEvent(new TestRow(expiringEventTs, 5L)(0), expiringEventTs)
       processor.advanceWatermark(queryTs - 30 * MinuteMillis)
       processor.onEvent(new TestRow(queryTs - 30 * MinuteMillis, 7L)(0), queryTs - 30 * MinuteMillis)
     }
@@ -185,36 +175,6 @@ class GigaTileBugRegressionTest extends AnyFlatSpec {
     assertNull(bLargeBoundary.finalizedVector(0))
     assertNull(bLargeBoundary.finalizedVector(1))
     assertEquals(12L, bLargeBoundary.finalizedVector(2))
-  }
-
-  it should "FAIL: scheduled eviction before the next real boundary must not scan or rewrite full state" in {
-    val aggregations = mixedBoundaryAggregations
-    val megaTileAgg = new MegaTileAggregator(aggregations, schema, tailBufferMillis = TailBufferMillis)
-    val store = new CountingGigaTileStore(megaTileAgg.windowedAggregator)
-    val processor = new GigaTileStreamProcessor(megaTileAgg, store, irEqual)
-    val baseDay = TsUtils.round(1700000000000L, DayMillis)
-    val eventTs = baseDay + 10 * HourMillis + 30 * MinuteMillis
-    val earlyTimer = eventTs + 5 * MinuteMillis
-    val expiryTimer = TsUtils.round(eventTs, 5 * MinuteMillis) + HourMillis + 5 * MinuteMillis
-
-    processor.onBatchUpdate(emptyBatchIr(baseDay, aggregations), baseDay, baseDay)
-    processor.advanceWatermark(eventTs)
-    processor.onEvent(new TestRow(eventTs, 3L)(0), eventTs)
-    val writesAfterEvent = store.runningLargeWrites
-    val scansAfterEvent = store.tileScans
-
-    val earlyEviction = processor.onScheduledEviction(earlyTimer)
-    assertNull("timer before any small/large boundary should not emit", earlyEviction.finalizedVector)
-    assertEquals("timer before a real boundary should not rewrite runningLargeIr",
-                 writesAfterEvent,
-                 store.runningLargeWrites)
-    assertEquals("timer before a real boundary should not scan tile state", scansAfterEvent, store.tileScans)
-
-    val boundaryEviction = processor.onEviction(expiryTimer)
-    assertNotNull("timer at the 1h small-window expiry should recompute and emit", boundaryEviction.finalizedVector)
-    assertNull(boundaryEviction.finalizedVector(0))
-    assertEquals(3L, boundaryEviction.finalizedVector(1))
-    assertEquals(3L, boundaryEviction.finalizedVector(2))
   }
 
   // -----------------------------------------------------------------

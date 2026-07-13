@@ -16,6 +16,14 @@ trait GigaTileStore extends TileStore {
   def getRunningLargeIr: Array[Any]
   def putRunningLargeIr(ir: Array[Any]): Unit
 
+  /** Hop-aligned as-of timestamp represented by the cached small-window IR. */
+  def getCachedSmallWindowAsOfTs: Long
+  def putCachedSmallWindowAsOfTs(ts: Long): Unit
+
+  /** As-of timestamp used by the last full running-large IR recomputation. */
+  def getLastLargeRecomputeAsOfTs: Long
+  def putLastLargeRecomputeAsOfTs(ts: Long): Unit
+
   // Per-day large-window IR state. One slot per day with streaming events between
   // batchEndDay and the current watermark day; pruned on batch advance.
   def getDailyLargeIr(dayStart: Long): Array[Any]

@@ -1,6 +1,12 @@
 package ai.chronon.flink.window
 
-import ai.chronon.aggregator.windowing.{FinalBatchIr, GigaTileStore, GigaTileStreamProcessor, MegaTileAggregator}
+import ai.chronon.aggregator.windowing.{
+  EvictionTimes,
+  FinalBatchIr,
+  GigaTileStore,
+  GigaTileStreamProcessor,
+  MegaTileAggregator
+}
 import ai.chronon.api.{Constants, DataType, GroupBy, TsUtils}
 import ai.chronon.api.ScalaJavaConversions.IteratorOps
 import ai.chronon.flink.SparkExpressionEval
@@ -57,6 +63,8 @@ class GigaTileProcessFunction(
   private var batchEndTsState: ValueState[java.lang.Long] = _
   private var runningLargeIrState: ValueState[Array[Byte]] = _
   private var nextProcessingEvictionTimerState: ValueState[java.lang.Long] = _
+  private var cachedSmallWindowAsOfTsState: ValueState[java.lang.Long] = _
+  private var lastLargeRecomputeAsOfTsState: ValueState[java.lang.Long] = _
   private var lastEmittedVersionState: ValueState[java.lang.Long] = _
   private var pendingVersionCollisionState: ValueState[java.lang.Long] = _
 
@@ -89,6 +97,10 @@ class GigaTileProcessFunction(
       getRuntimeContext.getState(new ValueStateDescriptor[Array[Byte]]("giga-tile-running-large", classOf[Array[Byte]]))
     nextProcessingEvictionTimerState = getRuntimeContext.getState(
       new ValueStateDescriptor[java.lang.Long]("giga-tile-next-evict-pt-timer", classOf[java.lang.Long]))
+    cachedSmallWindowAsOfTsState = getRuntimeContext.getState(
+      new ValueStateDescriptor[java.lang.Long]("giga-tile-cached-small-window-as-of-ts", classOf[java.lang.Long]))
+    lastLargeRecomputeAsOfTsState = getRuntimeContext.getState(
+      new ValueStateDescriptor[java.lang.Long]("giga-tile-last-large-recompute-as-of-ts", classOf[java.lang.Long]))
     lastEmittedVersionState = getRuntimeContext.getState(
       new ValueStateDescriptor[java.lang.Long]("giga-tile-last-emitted-version", classOf[java.lang.Long]))
     pendingVersionCollisionState = getRuntimeContext.getState(
@@ -122,10 +134,18 @@ class GigaTileProcessFunction(
         earliestTileStartState,
         batchIrState,
         batchEndTsState,
-        runningLargeIrState
+        runningLargeIrState,
+        cachedSmallWindowAsOfTsState,
+        lastLargeRecomputeAsOfTsState
       )
     }
   }
+
+  // Small-window ranges use an exclusive upper bound. At an exact hop, nudge only that
+  // horizon so the just-opened tile remains visible; large windows keep the real time.
+  private def adjustedSmallWindowAsOfTs(asOfTs: Long): Long =
+    if (asOfTs < Long.MaxValue && asOfTs == TsUtils.round(asOfTs, processor.minSmallWindowTileSize)) asOfTs + 1L
+    else asOfTs
 
   /** Processing-time callbacks can share a millisecond. Coalesce later same-millisecond updates
     * behind a timer so emitted versions are strictly increasing before async sink handoff.
@@ -313,7 +333,10 @@ class GigaTileProcessFunction(
       val currentProcessingTime = timerService.currentProcessingTime()
       repairExpiredProcessingTimerMarkers(timerService, currentProcessingTime, None)
       val rolloverResult = processor.advanceWatermark(currentProcessingTime)
-      val eventResult = processor.onEvent(row, tsMills, currentProcessingTime)
+      val eventResult = processor.onEvent(row,
+                                          tsMills,
+                                          largeWindowAsOfTs = currentProcessingTime,
+                                          smallWindowAsOfTs = adjustedSmallWindowAsOfTs(currentProcessingTime))
       val result = if (eventResult.finalizedVector != null) eventResult else rolloverResult
 
       scheduleProcessingEvictionTimerIfNeeded(timerService, currentProcessingTime)
@@ -347,7 +370,10 @@ class GigaTileProcessFunction(
       val rolloverResult = processor.advanceWatermark(currentProcessingTime)
 
       val batchIr = gigaTileCodec.decodeBatchIr(batchRow.valueBytes)
-      val batchResult = processor.onBatchUpdate(batchIr, batchRow.batchEndTs, currentProcessingTime)
+      val batchResult = processor.onBatchUpdate(batchIr,
+                                                batchRow.batchEndTs,
+                                                largeWindowAsOfTs = currentProcessingTime,
+                                                smallWindowAsOfTs = adjustedSmallWindowAsOfTs(currentProcessingTime))
       val result = if (batchResult.finalizedVector != null) batchResult else rolloverResult
 
       batchUpdateCounter.inc()
@@ -409,13 +435,15 @@ class GigaTileProcessFunction(
       if (isEvictionTimer) {
         nextProcessingEvictionTimerState.clear()
         val rolloverResult = processor.advanceWatermark(currentProcessingTime)
-        val evictionResult = processor.onScheduledEviction(currentProcessingTime)
+        val evictionResult = processor.onEviction(
+          EvictionTimes(timerTs = currentProcessingTime,
+                        smallWindowAsOfTs = adjustedSmallWindowAsOfTs(currentProcessingTime)))
         finalizedVector =
           if (evictionResult.finalizedVector != null) evictionResult.finalizedVector else rolloverResult.finalizedVector
 
         // Re-register before a coincident collision flush: if encoding the flush fails, both
         // the retry and normal eviction cadence remain live.
-        if (!evictionResult.isEmpty) {
+        if (!evictionResult.isEmpty || evictionResult.needsEvictionTimer) {
           scheduleProcessingEvictionTimerIfNeeded(timerService, currentProcessingTime)
         }
       }
@@ -509,6 +537,8 @@ class FlinkGigaTileStore(megaTileAgg: MegaTileAggregator, codec: MegaTileCodec, 
   private var batchIrState: ValueState[Array[Byte]] = _
   private var batchEndTsState: ValueState[java.lang.Long] = _
   private var runningLargeIrState: ValueState[Array[Byte]] = _
+  private var cachedSmallWindowAsOfTsState: ValueState[java.lang.Long] = _
+  private var lastLargeRecomputeAsOfTsState: ValueState[java.lang.Long] = _
 
   // Decode cache invalidated on key switch. Keeping per-day decoded values in an off-heap
   // mutable map would defeat the idea of per-key Flink state, so we just memoize the values
@@ -527,7 +557,9 @@ class FlinkGigaTileStore(megaTileAgg: MegaTileAggregator, codec: MegaTileCodec, 
                      earliest: ValueState[java.lang.Long],
                      batchIr: ValueState[Array[Byte]],
                      batchEndTs: ValueState[java.lang.Long],
-                     runningLarge: ValueState[Array[Byte]]): Unit = {
+                     runningLarge: ValueState[Array[Byte]],
+                     cachedSmallWindowAsOfTs: ValueState[java.lang.Long],
+                     lastLargeRecomputeAsOfTs: ValueState[java.lang.Long]): Unit = {
     tileState = tiles
     megaTileIrState = megaTileIr
     dailyLargeIrState = dailyLargeIr
@@ -536,6 +568,8 @@ class FlinkGigaTileStore(megaTileAgg: MegaTileAggregator, codec: MegaTileCodec, 
     batchIrState = batchIr
     batchEndTsState = batchEndTs
     runningLargeIrState = runningLarge
+    cachedSmallWindowAsOfTsState = cachedSmallWindowAsOfTs
+    lastLargeRecomputeAsOfTsState = lastLargeRecomputeAsOfTs
     cachedSmallValid = false
     batchIrValid = false
     runningLargeValid = false
@@ -576,6 +610,14 @@ class FlinkGigaTileStore(megaTileAgg: MegaTileAggregator, codec: MegaTileCodec, 
     megaTileIrState.update(codec.encode(ir))
     cachedSmallDecoded = ir; cachedSmallValid = true
   }
+
+  override def getCachedSmallWindowAsOfTs: Long =
+    Option(cachedSmallWindowAsOfTsState.value()).map(_.longValue()).getOrElse(-1L)
+  override def putCachedSmallWindowAsOfTs(ts: Long): Unit = cachedSmallWindowAsOfTsState.update(ts)
+
+  override def getLastLargeRecomputeAsOfTs: Long =
+    Option(lastLargeRecomputeAsOfTsState.value()).map(_.longValue()).getOrElse(Long.MinValue)
+  override def putLastLargeRecomputeAsOfTs(ts: Long): Unit = lastLargeRecomputeAsOfTsState.update(ts)
 
   // Today/yesterday accessors required by the parent TileStore trait but unused in GigaTile —
   // routing happens through the per-day map below. Stubbed to safe defaults so a misroute is

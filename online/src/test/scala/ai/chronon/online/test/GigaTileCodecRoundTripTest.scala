@@ -94,6 +94,8 @@ class GigaTileCodecRoundTripTest extends AnyFlatSpec {
     private var batchIrBytes: Array[Byte] = _
     private var batchEnd: Long = -1L
     private var runningLargeBytes: Array[Byte] = codec.encode(windowedAgg.init)
+    private var cachedSmallWindowAsOfTs: Long = -1L
+    private var lastLargeRecomputeAsOfTs: Long = Long.MinValue
 
     override def getTile(h: Long, t: Long): Array[Any] = tileBytes.get((h, t)).map(codec.decodeBaseIr).orNull
     override def putTile(h: Long, t: Long, ir: Array[Any]): Unit = tileBytes((h, t)) = codec.encodeBaseIr(ir)
@@ -122,6 +124,10 @@ class GigaTileCodecRoundTripTest extends AnyFlatSpec {
     override def putBatchEndTs(ts: Long): Unit = batchEnd = ts
     override def getRunningLargeIr: Array[Any] = codec.decode(runningLargeBytes)
     override def putRunningLargeIr(ir: Array[Any]): Unit = runningLargeBytes = codec.encode(ir)
+    override def getCachedSmallWindowAsOfTs: Long = cachedSmallWindowAsOfTs
+    override def putCachedSmallWindowAsOfTs(ts: Long): Unit = cachedSmallWindowAsOfTs = ts
+    override def getLastLargeRecomputeAsOfTs: Long = lastLargeRecomputeAsOfTs
+    override def putLastLargeRecomputeAsOfTs(ts: Long): Unit = lastLargeRecomputeAsOfTs = ts
 
     // Daily slot IRs are base-aggregator-shaped (one column per (op, input)) — fanned out
     // to per-window columns at recompute time via baseIrIndices.

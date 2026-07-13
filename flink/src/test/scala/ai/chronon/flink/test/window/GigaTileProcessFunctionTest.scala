@@ -1,8 +1,11 @@
 package ai.chronon.flink.test.window
 
 import ai.chronon.aggregator.windowing.{
+  EvictionTimes,
   GigaEmitResult,
   GigaTileStreamProcessor,
+  InMemoryGigaTileStore,
+  MegaTileAggregator,
   SawtoothOnlineAggregator
 }
 import ai.chronon.api._
@@ -10,11 +13,12 @@ import ai.chronon.api.Extensions.WindowOps
 import ai.chronon.flink.deser.ProjectedEvent
 import ai.chronon.flink.types.{BatchIrRow, TimestampedTile}
 import ai.chronon.flink.window.GigaTileProcessFunction
-import ai.chronon.online.GigaTileCodec
+import ai.chronon.online.{GigaTileCodec, MegaTileCodec}
 import ai.chronon.online.serde.{ArrayRow, AvroCodec}
-import org.apache.flink.api.common.state.ValueState
+import org.apache.flink.api.common.state.{MapState, MapStateDescriptor, ValueState, ValueStateDescriptor}
 import org.apache.flink.api.common.typeinfo.TypeInformation
 import org.apache.flink.api.java.functions.KeySelector
+import org.apache.flink.configuration.Configuration
 import org.apache.flink.runtime.state.KeyedStateBackend
 import org.apache.flink.streaming.api.functions.co.KeyedCoProcessFunction
 import org.apache.flink.streaming.api.operators.co.KeyedCoProcessOperator
@@ -144,6 +148,51 @@ class GigaTileProcessFunctionTest extends AnyFlatSpec with Matchers {
 
       testHarness.extractOutputValues().asScala shouldBe empty
       testHarness.numProcessingTimeTimers() shouldEqual 1
+    } finally testHarness.close()
+  }
+
+  it should "keep an empty key scheduled until a deferred future batch activates" in {
+    val dayMillis = new Window(1, TimeUnit.DAYS).millis
+    val hourMillis = new Window(1, TimeUnit.HOURS).millis
+    val batchGroupBy = Builders.GroupBy(
+      metaData = Builders.MetaData(name = "gigatile-process-function-future-batch-test"),
+      aggregations = Seq(Builders.Aggregation(Operation.SUM, "num", Seq(new Window(7, TimeUnit.DAYS)))))
+    val testHarness = harness(new GigaTileProcessFunction(batchGroupBy, inputSchema))
+    val batchCodec = new GigaTileCodec(batchGroupBy, inputSchema)
+    val currentBatchEnd = 10 * dayMillis
+    val currentProcessingTs = currentBatchEnd + hourMillis
+    val futureBatchEnd = currentBatchEnd + dayMillis
+    val futureEventTs = futureBatchEnd - hourMillis
+    val batchAggregator =
+      new SawtoothOnlineAggregator(futureBatchEnd, batchGroupBy.getAggregations.asScala.toSeq, inputSchema)
+    val futureBatchIr = batchAggregator.update(
+      batchAggregator.init,
+      new ArrayRow(Array[Any](futureEventTs, 50L), futureEventTs))
+    val futureBatchRow = new BatchIrRow(
+      entityKey(),
+      batchCodec.encodeBatchIr(batchAggregator.denormalizeBatchIr(batchAggregator.normalizeBatchIr(futureBatchIr))),
+      futureBatchEnd)
+
+    try {
+      testHarness.open()
+      testHarness.setProcessingTime(currentProcessingTs)
+      testHarness.processElement2(emptyBatchRow(batchGroupBy, currentBatchEnd), currentBatchEnd)
+      testHarness.processElement2(futureBatchRow, futureBatchEnd)
+
+      testHarness.extractOutputValues().asScala shouldBe empty
+      testHarness.numProcessingTimeTimers() shouldEqual 1
+
+      testHarness.setProcessingTime(currentProcessingTs + hourMillis)
+
+      testHarness.extractOutputValues().asScala shouldBe empty
+      testHarness.numProcessingTimeTimers() shouldEqual 1
+
+      testHarness.setProcessingTime(futureBatchEnd + hourMillis)
+
+      val outputs = testHarness.extractOutputValues()
+      outputs.size() shouldEqual 1
+      decodeSum(outputs.get(0), batchGroupBy) shouldEqual 50L
+      outputs.get(0).latestTsMillis shouldEqual futureBatchEnd + hourMillis
     } finally testHarness.close()
   }
 
@@ -446,7 +495,7 @@ class GigaTileProcessFunctionTest extends AnyFlatSpec with Matchers {
       testHarness.setProcessingTime(collisionProcessingTs)
       testHarness.processElement1(event(expiringEventTs, 5L), expiringEventTs)
       testHarness.processElement1(event(expiringEventTs, 7L), expiringEventTs)
-      failNextScheduledEviction(function)
+      failNextEviction(function)
 
       testHarness.setProcessingTime(evictionTs)
 
@@ -487,6 +536,89 @@ class GigaTileProcessFunctionTest extends AnyFlatSpec with Matchers {
         .toMap
       flushedByKey shouldEqual Map("campaign-1" -> 12L, "campaign-2" -> 24L)
     } finally testHarness.close()
+  }
+
+  it should "include an event that arrives exactly on a small-window hop" in {
+    val testHarness = harness(new GigaTileProcessFunction(groupBy, inputSchema))
+    val hopMillis = new Window(5, TimeUnit.MINUTES).millis
+    val exactHopTs = 30 * hopMillis
+
+    try {
+      testHarness.open()
+      testHarness.setProcessingTime(exactHopTs)
+      testHarness.processElement1(event(exactHopTs, 5L), exactHopTs)
+
+      val output = testHarness.extractOutputValues().get(0)
+      decodeSum(output) shouldEqual 5L
+      output.latestTsMillis shouldEqual exactHopTs
+    } finally testHarness.close()
+  }
+
+  it should "restore state from before the horizon markers existed" in {
+    val eventTimestamp = 4 * new Window(1, TimeUnit.DAYS).millis + new Window(1, TimeUnit.HOURS).millis
+    val legacyHarness = harness(new LegacyHorizonStateFunction(groupBy, inputSchema))
+    legacyHarness.open()
+    legacyHarness.processElement1(event(eventTimestamp, 5L), eventTimestamp)
+    val snapshot = legacyHarness.snapshot(9L, eventTimestamp)
+    legacyHarness.close()
+
+    val restoredHarness = harness(new GigaTileProcessFunction(groupBy, inputSchema))
+    val batchCallbackTs = eventTimestamp + new Window(2, TimeUnit.HOURS).millis
+    try {
+      restoredHarness.setup()
+      restoredHarness.initializeState(snapshot)
+      restoredHarness.open()
+      restoredHarness.setProcessingTime(batchCallbackTs)
+      restoredHarness.processElement2(emptyBatchRow(groupBy, batchEndTs = 0L), 0L)
+
+      val outputs = restoredHarness.extractOutputValues()
+      outputs.size() shouldEqual 1
+      decodeSum(outputs.get(0)) shouldBe null
+      outputs.get(0).latestTsMillis shouldEqual batchCallbackTs
+    } finally restoredHarness.close()
+  }
+
+  it should "rebuild large state when a restored checkpoint has no recompute marker" in {
+    val dayMillis = new Window(1, TimeUnit.DAYS).millis
+    val hourMillis = new Window(1, TimeUnit.HOURS).millis
+    val batchEndTs = 10 * dayMillis
+    val batchEventTs = batchEndTs - 48 * hourMillis
+    val beforeExpiry = batchEndTs + 59 * 60 * 1000L
+    val delayedCallbackTs = batchEndTs + 3 * hourMillis + 60 * 1000L
+    val batchGroupBy = Builders.GroupBy(
+      metaData = Builders.MetaData(name = "gigatile-process-function-legacy-large-marker-test"),
+      aggregations = Seq(Builders.Aggregation(Operation.SUM, "num", Seq(new Window(49, TimeUnit.HOURS)))))
+    val batchAggregator =
+      new SawtoothOnlineAggregator(batchEndTs, batchGroupBy.getAggregations.asScala.toSeq, inputSchema)
+    val batchIr = batchAggregator.update(
+      batchAggregator.init,
+      new ArrayRow(Array[Any](batchEventTs, 5L), batchEventTs))
+    val finalBatchIr = batchAggregator.denormalizeBatchIr(batchAggregator.normalizeBatchIr(batchIr))
+    val batchRow = new BatchIrRow(
+      entityKey(),
+      new GigaTileCodec(batchGroupBy, inputSchema).encodeBatchIr(finalBatchIr),
+      batchEndTs)
+
+    val legacyHarness = harness(new LegacyHorizonStateFunction(batchGroupBy, inputSchema))
+    legacyHarness.open()
+    legacyHarness.setProcessingTime(beforeExpiry)
+    legacyHarness.processElement2(batchRow, batchEndTs)
+    val snapshot = legacyHarness.snapshot(10L, beforeExpiry)
+    legacyHarness.close()
+
+    val restoredHarness = harness(new GigaTileProcessFunction(batchGroupBy, inputSchema))
+    try {
+      restoredHarness.setup()
+      restoredHarness.initializeState(snapshot)
+      restoredHarness.open()
+      restoredHarness.setProcessingTime(delayedCallbackTs)
+      restoredHarness.processElement1(event(delayedCallbackTs - 1L, 7L), delayedCallbackTs - 1L)
+
+      val outputs = restoredHarness.extractOutputValues()
+      outputs.size() shouldEqual 1
+      decodeSum(outputs.get(0), batchGroupBy) shouldEqual 7L
+      outputs.get(0).latestTsMillis shouldEqual delayedCallbackTs
+    } finally restoredHarness.close()
   }
 }
 
@@ -601,7 +733,7 @@ object GigaTileProcessFunctionTest {
       })
   }
 
-  private def failNextScheduledEviction(function: GigaTileProcessFunction): Unit = {
+  private def failNextEviction(function: GigaTileProcessFunction): Unit = {
     val processorField = classOf[GigaTileProcessFunction].getDeclaredField("processor")
     processorField.setAccessible(true)
     val delegate = processorField.get(function).asInstanceOf[GigaTileStreamProcessor]
@@ -615,15 +747,22 @@ object GigaTileProcessFunctionTest {
       ) {
         private var shouldFail = true
 
-        override def onScheduledEviction(timerTs: Long): GigaEmitResult = {
+        override private[chronon] def onEviction(evictionTimes: EvictionTimes): GigaEmitResult = {
           if (shouldFail) {
             shouldFail = false
-            throw new RuntimeException("expected scheduled eviction failure")
+            throw new RuntimeException("expected eviction failure")
           }
-          delegate.onScheduledEviction(timerTs)
+          delegate.onEviction(evictionTimes)
         }
       }
     )
+  }
+
+  private def emptyBatchRow(batchGroupBy: GroupBy, batchEndTs: Long): BatchIrRow = {
+    val batchAggregator =
+      new SawtoothOnlineAggregator(batchEndTs, batchGroupBy.getAggregations.asScala.toSeq, inputSchema)
+    val emptyBatchIr = batchAggregator.denormalizeBatchIr(batchAggregator.normalizeBatchIr(batchAggregator.init))
+    new BatchIrRow(entityKey(), new GigaTileCodec(batchGroupBy, inputSchema).encodeBatchIr(emptyBatchIr), batchEndTs)
   }
 
   private class LegacyEventTimeTimerFunction(timerTimestamps: Seq[Long])
@@ -679,5 +818,82 @@ object GigaTileProcessFunctionTest {
         ctx: KeyedCoProcessFunction[util.List[Any], ProjectedEvent, BatchIrRow, TimestampedTile]#Context,
         out: Collector[TimestampedTile]
     ): Unit = ()
+  }
+
+  /** Seeds only descriptors that existed before the cached-as-of markers were introduced. */
+  private class LegacyHorizonStateFunction(groupBy: GroupBy, inputSchema: Seq[(String, DataType)])
+      extends KeyedCoProcessFunction[util.List[Any], ProjectedEvent, BatchIrRow, TimestampedTile] {
+    private var tileState: MapState[String, Array[Byte]] = _
+    private var megaTileIrState: ValueState[Array[Byte]] = _
+    private var currentDayStartState: ValueState[java.lang.Long] = _
+    private var earliestTileStartState: ValueState[java.lang.Long] = _
+    private var batchIrState: ValueState[Array[Byte]] = _
+    private var batchEndTsState: ValueState[java.lang.Long] = _
+    private var runningLargeIrState: ValueState[Array[Byte]] = _
+    private var megaTileAgg: MegaTileAggregator = _
+    private var codec: MegaTileCodec = _
+    private var gigaCodec: GigaTileCodec = _
+
+    override def open(parameters: Configuration): Unit = {
+      super.open(parameters)
+      val aggregations = groupBy.getAggregations.asScala.toSeq
+      megaTileAgg = new MegaTileAggregator(aggregations, inputSchema)
+      codec = new MegaTileCodec(groupBy, inputSchema)
+      gigaCodec = new GigaTileCodec(groupBy, inputSchema)
+      tileState = getRuntimeContext.getMapState(
+        new MapStateDescriptor[String, Array[Byte]]("giga-tile-tiles", classOf[String], classOf[Array[Byte]]))
+      megaTileIrState = getRuntimeContext.getState(
+        new ValueStateDescriptor[Array[Byte]]("giga-tile-ir", classOf[Array[Byte]]))
+      currentDayStartState = getRuntimeContext.getState(
+        new ValueStateDescriptor[java.lang.Long]("giga-tile-day-start", classOf[java.lang.Long]))
+      earliestTileStartState = getRuntimeContext.getState(
+        new ValueStateDescriptor[java.lang.Long]("giga-tile-earliest-tile", classOf[java.lang.Long]))
+      batchIrState = getRuntimeContext.getState(
+        new ValueStateDescriptor[Array[Byte]]("giga-tile-batch-ir", classOf[Array[Byte]]))
+      batchEndTsState = getRuntimeContext.getState(
+        new ValueStateDescriptor[java.lang.Long]("giga-tile-batch-end", classOf[java.lang.Long]))
+      runningLargeIrState = getRuntimeContext.getState(
+        new ValueStateDescriptor[Array[Byte]]("giga-tile-running-large", classOf[Array[Byte]]))
+    }
+
+    override def processElement1(
+        event: ProjectedEvent,
+        ctx: KeyedCoProcessFunction[util.List[Any], ProjectedEvent, BatchIrRow, TimestampedTile]#Context,
+        out: Collector[TimestampedTile]
+    ): Unit = {
+      val timestamp = event.fields(Constants.TimeColumn).asInstanceOf[Long]
+      val row = new ArrayRow(inputSchema.map { case (name, _) => event.fields(name) }.toArray, timestamp)
+      val baseIr = megaTileAgg.baseAggregator.init
+      megaTileAgg.baseAggregator.update(baseIr, row)
+      val tileStarts = megaTileAgg.tileStartsForEvent(timestamp)
+      tileStarts.foreach { case (hopSize, tileStart) =>
+        tileState.put(s"$hopSize:$tileStart", codec.encodeBaseIr(baseIr))
+      }
+
+      val cachedIr = megaTileAgg.windowedAggregator.init
+      megaTileAgg.windowedAggregator.columnAggregators(0).update(cachedIr, row)
+      megaTileIrState.update(codec.encode(cachedIr))
+      currentDayStartState.update(TsUtils.round(timestamp, new Window(1, TimeUnit.DAYS).millis))
+      earliestTileStartState.update(tileStarts.map(_._2).min)
+    }
+
+    override def processElement2(
+        batchRow: BatchIrRow,
+        ctx: KeyedCoProcessFunction[util.List[Any], ProjectedEvent, BatchIrRow, TimestampedTile]#Context,
+        out: Collector[TimestampedTile]
+    ): Unit = {
+      val batchIr = gigaCodec.decodeBatchIr(batchRow.valueBytes)
+      val seedStore = new InMemoryGigaTileStore(megaTileAgg.windowedAggregator)
+      val seedProcessor = new GigaTileStreamProcessor(megaTileAgg, seedStore)
+      seedProcessor.onBatchUpdate(
+        batchIr,
+        batchRow.batchEndTs,
+        ctx.timerService().currentProcessingTime())
+
+      batchIrState.update(gigaCodec.encodeBatchIr(seedStore.getBatchIr))
+      batchEndTsState.update(batchRow.batchEndTs)
+      runningLargeIrState.update(codec.encode(seedStore.getRunningLargeIr))
+      currentDayStartState.update(TsUtils.round(batchRow.batchEndTs, new Window(1, TimeUnit.DAYS).millis))
+    }
   }
 }
