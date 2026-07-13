@@ -1121,6 +1121,44 @@ class GigaTileProcessFunctionTest extends AnyFlatSpec with Matchers {
     } finally testHarness.close()
   }
 
+  it should "re-arm shared eviction and collision roles when eviction fails" in {
+    val function = new GigaTileProcessFunction(groupBy, inputSchema)
+    val testHarness = harness(function)
+    val evictionTs = nextEvictionHop(processingTs)
+    val initialProcessingTs = evictionTs - 1L
+    val expiringEventTs = evictionTs - new Window(1, TimeUnit.HOURS).millis - 1L
+
+    try {
+      testHarness.open()
+      testHarness.setProcessingTime(initialProcessingTs)
+      advanceToHealthyLiveWatermark(testHarness, initialProcessingTs)
+      testHarness.processElement1(event(expiringEventTs, 5L), expiringEventTs)
+      testHarness.processElement1(event(expiringEventTs, 7L), expiringEventTs)
+
+      testHarness.extractOutputValues().size() shouldEqual 1
+      testHarness.numProcessingTimeTimers() shouldEqual 1
+      failNextEviction(function)
+
+      testHarness.setProcessingTime(evictionTs)
+
+      testHarness.extractOutputValues().size() shouldEqual 1
+      testHarness.numProcessingTimeTimers() shouldEqual 1
+      val retryTs = nextEvictionHop(evictionTs)
+      setCurrentKey(testHarness, entityKey())
+      valueState[java.lang.Long](function, "nextProcessingEvictionTimerState").value() shouldEqual retryTs
+      valueState[java.lang.Long](function, "pendingVersionCollisionState").value() shouldEqual retryTs
+
+      advanceToHealthyLiveWatermark(testHarness, retryTs)
+      testHarness.setProcessingTime(retryTs)
+
+      val outputs = testHarness.extractOutputValues()
+      outputs.size() shouldEqual 2
+      decodeSum(outputs.get(1)) shouldBe null
+      outputs.get(1).latestTsMillis shouldEqual retryTs
+      testHarness.numProcessingTimeTimers() shouldEqual 0
+    } finally testHarness.close()
+  }
+
   it should "evict before flushing when version and eviction timers coincide" in {
     val testHarness = harness(new GigaTileProcessFunction(groupBy, inputSchema))
     val hopMillis = new Window(5, TimeUnit.MINUTES).millis
@@ -1202,6 +1240,435 @@ class GigaTileProcessFunctionTest extends AnyFlatSpec with Matchers {
         .map(tile => tile.keys.get(0).toString -> decodeSum(tile))
         .toMap
       flushedByKey shouldEqual Map("campaign-1" -> 12L, "campaign-2" -> 24L)
+    } finally testHarness.close()
+  }
+
+  it should "coalesce live updates onto one wall-clock cadence" in {
+    val cadenceMillis = 1000L
+    val function = new GigaTileProcessFunction(groupBy, inputSchema, bufferingOutputTimeMillis = cadenceMillis)
+    val testHarness = harness(function)
+    val cadenceTs = nextBufferedWriteTick(groupBy, entityKey(), processingTs, cadenceMillis)
+
+    try {
+      testHarness.open()
+      testHarness.setProcessingTime(processingTs)
+      advanceToHealthyLiveWatermark(testHarness, processingTs)
+      testHarness.processElement1(event(processingTs - 2000L, 5L), processingTs - 2000L)
+      testHarness.processElement1(event(processingTs - 1999L, 7L), processingTs - 1999L)
+
+      testHarness.extractOutputValues() shouldBe empty
+      setCurrentKey(testHarness, entityKey())
+      valueState[java.lang.Boolean](function, "pendingPublicationState").value() shouldEqual java.lang.Boolean.TRUE
+      testHarness.setProcessingTime(cadenceTs)
+
+      val outputs = testHarness.extractOutputValues()
+      outputs should have size 1
+      decodeSum(outputs.get(0)) shouldEqual 12L
+      outputs.get(0).latestTsMillis shouldEqual processingTs
+      setCurrentKey(testHarness, entityKey())
+      valueState[java.lang.Boolean](function, "pendingPublicationState").value() shouldBe null
+    } finally testHarness.close()
+  }
+
+  it should "hold a live batch refresh until the wall-clock cadence" in {
+    val cadenceMillis = 1000L
+    val batchGroupBy = Builders.GroupBy(
+      metaData = Builders.MetaData(name = "gigatile-buffered-batch-test"),
+      aggregations = Seq(Builders.Aggregation(Operation.SUM, "num", Seq(new Window(7, TimeUnit.DAYS)))))
+    val testHarness = harness(
+      new GigaTileProcessFunction(batchGroupBy, inputSchema, bufferingOutputTimeMillis = cadenceMillis))
+    val cadenceTs = nextBufferedWriteTick(batchGroupBy, entityKey(), processingTs, cadenceMillis)
+
+    try {
+      testHarness.open()
+      testHarness.setProcessingTime(processingTs)
+      advanceToHealthyLiveWatermark(testHarness, processingTs)
+      testHarness.processElement2(batchRow(batchGroupBy, 0L, -1000L, 7L), 0L)
+
+      testHarness.extractOutputValues() shouldBe empty
+      testHarness.setProcessingTime(cadenceTs)
+
+      val outputs = testHarness.extractOutputValues()
+      outputs should have size 1
+      decodeSum(outputs.get(0), batchGroupBy) shouldEqual 7L
+      outputs.get(0).latestTsMillis shouldEqual processingTs
+    } finally testHarness.close()
+  }
+
+  it should "park a buffered write across Catchup cadence intervals and rebuild once Live" in {
+    val cadenceMillis = 1000L
+    val function = new GigaTileProcessFunction(groupBy, inputSchema, bufferingOutputTimeMillis = cadenceMillis)
+    val testHarness = harness(function)
+    val firstCadenceTs = nextBufferedWriteTick(groupBy, entityKey(), processingTs, cadenceMillis)
+    val catchupThreshold = new Window(5, TimeUnit.MINUTES).millis + FlinkJob.CatchupWatermarkLagSlackMillis
+    val watermark = processingTs - catchupThreshold + (firstCadenceTs - processingTs) / 2L
+    val evictionTs = nextEvictionHop(processingTs)
+    val afterSeveralCadences = firstCadenceTs + 10L * cadenceMillis
+    val liveCadenceTs = nextBufferedWriteTick(groupBy, entityKey(), afterSeveralCadences, cadenceMillis)
+
+    try {
+      testHarness.open()
+      testHarness.setProcessingTime(processingTs)
+      advanceToLiveWatermark(testHarness, watermark)
+      testHarness.processElement1(event(watermark - 1L, 5L), watermark - 1L)
+      setCurrentKey(testHarness, entityKey())
+      valueState[java.lang.Long](function, "pendingPublicationRetryTimerState").value() shouldBe null
+      valueState[java.lang.Long](function, "pendingPublicationActivationTimerState").value() shouldBe null
+
+      testHarness.setProcessingTime(firstCadenceTs)
+      testHarness.extractOutputValues() shouldBe empty
+      setCurrentKey(testHarness, entityKey())
+      valueState[java.lang.Long](function, "nextBufferedWriteTimerState").value() shouldBe null
+      valueState[java.lang.Long](function, "bufferedWriteLatestTsState").value() shouldEqual processingTs
+      valueState[java.lang.Boolean](function, "pendingPublicationState").value() shouldEqual java.lang.Boolean.TRUE
+      testHarness.numProcessingTimeTimers() shouldEqual 1
+      testHarness.numEventTimeTimers() shouldEqual 1
+      valueState[java.lang.Long](function, "pendingPublicationRetryTimerState").value() shouldBe null
+      valueState[java.lang.Long](function, "pendingPublicationActivationTimerState").value() should not be null
+
+      afterSeveralCadences should be < evictionTs
+      testHarness.setProcessingTime(afterSeveralCadences)
+      testHarness.extractOutputValues() shouldBe empty
+      testHarness.numProcessingTimeTimers() shouldEqual 1
+      testHarness.numEventTimeTimers() shouldEqual 1
+
+      advanceToHealthyLiveWatermark(testHarness, afterSeveralCadences)
+      testHarness.extractOutputValues() shouldBe empty
+      setCurrentKey(testHarness, entityKey())
+      valueState[java.lang.Long](function, "pendingPublicationActivationTimerState").value() shouldBe null
+      valueState[java.lang.Long](function, "nextBufferedWriteTimerState").value() shouldEqual liveCadenceTs
+      testHarness.setProcessingTime(liveCadenceTs)
+
+      val outputs = testHarness.extractOutputValues()
+      outputs should have size 1
+      decodeSum(outputs.get(0)) shouldEqual 5L
+      outputs.get(0).latestTsMillis shouldEqual afterSeveralCadences
+    } finally testHarness.close()
+  }
+
+  it should "run eviction before a cadence timer at the same timestamp" in {
+    val cadenceMillis = 1L
+    val collisionTs = nextEvictionHop(processingTs)
+    val eventProcessingTs = collisionTs - 1L
+    val expiringEventTs = collisionTs - new Window(1, TimeUnit.HOURS).millis - 1L
+    val testHarness = harness(
+      new GigaTileProcessFunction(groupBy, inputSchema, bufferingOutputTimeMillis = cadenceMillis))
+
+    try {
+      testHarness.open()
+      testHarness.setProcessingTime(eventProcessingTs)
+      advanceToHealthyLiveWatermark(testHarness, eventProcessingTs)
+      testHarness.processElement1(event(expiringEventTs, 5L), expiringEventTs)
+
+      testHarness.extractOutputValues() shouldBe empty
+      testHarness.setProcessingTime(collisionTs)
+
+      val outputs = testHarness.extractOutputValues()
+      outputs should have size 1
+      decodeSum(outputs.get(0)) shouldBe null
+      outputs.get(0).latestTsMillis shouldEqual collisionTs
+    } finally testHarness.close()
+  }
+
+  it should "emit once after eviction when all four timer roles share a callback" in {
+    val collisionTs = nextEvictionHop(processingTs)
+    val eventProcessingTs = collisionTs - 1L
+    val expiringEventTs = collisionTs - new Window(1, TimeUnit.HOURS).millis - 1L
+    val function = new GigaTileProcessFunction(groupBy, inputSchema, bufferingOutputTimeMillis = 1L)
+    val testHarness = harness(function)
+
+    try {
+      testHarness.open()
+      testHarness.setProcessingTime(eventProcessingTs)
+      advanceToHealthyLiveWatermark(testHarness, eventProcessingTs)
+      testHarness.processElement1(event(expiringEventTs, 5L), expiringEventTs)
+      setCurrentKey(testHarness, entityKey())
+      valueState[java.lang.Long](function, "pendingVersionCollisionState").update(collisionTs)
+      valueState[java.lang.Long](function, "pendingPublicationRetryTimerState").update(collisionTs)
+      valueState[java.lang.Boolean](function, "pendingPublicationState").update(java.lang.Boolean.TRUE)
+
+      testHarness.setProcessingTime(collisionTs)
+
+      val outputs = testHarness.extractOutputValues()
+      outputs should have size 1
+      decodeSum(outputs.get(0)) shouldBe null
+      outputs.get(0).latestTsMillis shouldEqual collisionTs
+      valueState[java.lang.Long](function, "pendingVersionCollisionState").value() shouldBe null
+    } finally testHarness.close()
+  }
+
+  it should "clear a later cadence after a shared eviction and collision publishes" in {
+    val cadenceMillis = new Window(1, TimeUnit.HOURS).millis
+    val seedCadenceTs = nextBufferedWriteTick(groupBy, entityKey(), processingTs, cadenceMillis)
+    val eventProcessingTs = seedCadenceTs + 1L
+    val evictionTs = nextEvictionHop(eventProcessingTs)
+    val cadenceTs = nextBufferedWriteTick(groupBy, entityKey(), eventProcessingTs, cadenceMillis)
+    val expiringEventTs = evictionTs - new Window(1, TimeUnit.HOURS).millis - 1L
+    val function =
+      new GigaTileProcessFunction(groupBy, inputSchema, bufferingOutputTimeMillis = cadenceMillis)
+    val testHarness = harness(function)
+
+    cadenceTs should be > evictionTs
+    try {
+      testHarness.open()
+      testHarness.setProcessingTime(eventProcessingTs)
+      advanceToHealthyLiveWatermark(testHarness, eventProcessingTs)
+      testHarness.processElement1(event(expiringEventTs, 5L), expiringEventTs)
+      setCurrentKey(testHarness, entityKey())
+      valueState[java.lang.Long](function, "pendingVersionCollisionState").update(evictionTs)
+
+      advanceToHealthyLiveWatermark(testHarness, evictionTs)
+      testHarness.setProcessingTime(evictionTs)
+
+      val outputs = testHarness.extractOutputValues()
+      outputs should have size 1
+      decodeSum(outputs.get(0)) shouldBe null
+      valueState[java.lang.Long](function, "bufferedWriteLatestTsState").value() shouldBe null
+      valueState[java.lang.Long](function, "nextBufferedWriteTimerState").value() shouldBe null
+
+      testHarness.setProcessingTime(cadenceTs + 1L)
+      testHarness.extractOutputValues() should have size 1
+      testHarness.numProcessingTimeTimers() shouldEqual 0
+    } finally testHarness.close()
+  }
+
+  it should "retry a failed cadence encoding on the next cadence tick" in {
+    val cadenceMillis = 1000L
+    val function = new GigaTileProcessFunction(groupBy, inputSchema, bufferingOutputTimeMillis = cadenceMillis)
+    val testHarness = harness(function)
+    val firstCadenceTs = nextBufferedWriteTick(groupBy, entityKey(), processingTs, cadenceMillis)
+    val secondCadenceTs = nextBufferedWriteTick(groupBy, entityKey(), firstCadenceTs, cadenceMillis)
+
+    try {
+      testHarness.open()
+      testHarness.setProcessingTime(processingTs)
+      advanceToHealthyLiveWatermark(testHarness, processingTs)
+      testHarness.processElement1(event(processingTs - 1000L, 5L), processingTs - 1000L)
+      failNextEncode(function)
+
+      testHarness.setProcessingTime(firstCadenceTs)
+      testHarness.extractOutputValues() shouldBe empty
+      testHarness.setProcessingTime(secondCadenceTs)
+
+      val outputs = testHarness.extractOutputValues()
+      outputs should have size 1
+      decodeSum(outputs.get(0)) shouldEqual 5L
+    } finally testHarness.close()
+  }
+
+  it should "isolate buffered cadence state by key" in {
+    val cadenceMillis = 1000L
+    val testHarness = harness(
+      new GigaTileProcessFunction(groupBy, inputSchema, bufferingOutputTimeMillis = cadenceMillis))
+    val keys = Seq("campaign-1", "campaign-2")
+    val lastCadenceTs = keys.map(key => nextBufferedWriteTick(groupBy, entityKey(key), processingTs, cadenceMillis)).max
+
+    try {
+      testHarness.open()
+      testHarness.setProcessingTime(processingTs)
+      advanceToHealthyLiveWatermark(testHarness, processingTs)
+      testHarness.processElement1(keyedEvent(keys.head, processingTs - 1000L, 5L), processingTs - 1000L)
+      testHarness.processElement1(keyedEvent(keys.last, processingTs - 1000L, 11L), processingTs - 1000L)
+
+      testHarness.extractOutputValues() shouldBe empty
+      testHarness.setProcessingTime(lastCadenceTs)
+
+      val byKey = testHarness.extractOutputValues().asScala.map { tile =>
+        tile.keys.get(0).toString -> decodeSum(tile)
+      }.toMap
+      byKey shouldEqual Map("campaign-1" -> 5L, "campaign-2" -> 11L)
+    } finally testHarness.close()
+  }
+
+  it should "preserve a pending cadence while draining an earlier callback" in {
+    val cadenceMillis = 1000L
+    val firstCadenceTs = nextBufferedWriteTick(groupBy, entityKey(), processingTs, cadenceMillis)
+    val eventProcessingTime = if (firstCadenceTs - processingTs > 1L) processingTs else processingTs + 1L
+    val cadenceTs = nextBufferedWriteTick(groupBy, entityKey(), eventProcessingTime, cadenceMillis)
+    val injectedTimer = eventProcessingTime + 1L
+    injectedTimer should be < cadenceTs
+    val originalHarness = harness(
+      new GigaTileProcessFunction(groupBy, inputSchema, bufferingOutputTimeMillis = cadenceMillis))
+    originalHarness.open()
+    originalHarness.setProcessingTime(eventProcessingTime)
+    advanceToHealthyLiveWatermark(originalHarness, eventProcessingTime)
+    originalHarness.processElement1(event(eventProcessingTime - 1000L, 5L), eventProcessingTime - 1000L)
+    val snapshot = originalHarness.snapshot(20L, eventProcessingTime)
+    originalHarness.close()
+
+    val injectorHarness = harness(new ProcessingTimerInjector(injectedTimer))
+    injectorHarness.setup()
+    injectorHarness.initializeState(snapshot)
+    injectorHarness.open()
+    injectorHarness.setProcessingTime(eventProcessingTime)
+    injectorHarness.processElement1(event(eventProcessingTime - 1000L, 0L), eventProcessingTime - 1000L)
+    val injectedSnapshot = injectorHarness.snapshot(21L, eventProcessingTime)
+    injectorHarness.close()
+
+    val restoredHarness = harness(
+      new GigaTileProcessFunction(groupBy, inputSchema, bufferingOutputTimeMillis = cadenceMillis))
+    try {
+      restoredHarness.setup()
+      restoredHarness.initializeState(injectedSnapshot)
+      restoredHarness.open()
+      restoredHarness.setProcessingTime(eventProcessingTime)
+      // The injected callback runs first while Flink already reports cadenceTs. It must not
+      // move the still-queued cadence marker to the following interval.
+      restoredHarness.numProcessingTimeTimers() shouldEqual 3
+      advanceToHealthyLiveWatermark(restoredHarness, cadenceTs)
+      restoredHarness.setProcessingTime(cadenceTs)
+
+      val outputs = restoredHarness.extractOutputValues()
+      outputs should have size 1
+      decodeSum(outputs.get(0)) shouldEqual 5L
+      outputs.get(0).latestTsMillis shouldEqual eventProcessingTime
+    } finally restoredHarness.close()
+  }
+
+  it should "flush a restored cadence after buffering is disabled" in {
+    val cadenceMillis = 1000L
+    val cadenceTs = nextBufferedWriteTick(groupBy, entityKey(), processingTs, cadenceMillis)
+    val originalHarness = harness(
+      new GigaTileProcessFunction(groupBy, inputSchema, bufferingOutputTimeMillis = cadenceMillis))
+    originalHarness.open()
+    originalHarness.setProcessingTime(processingTs)
+    advanceToHealthyLiveWatermark(originalHarness, processingTs)
+    originalHarness.processElement1(event(processingTs - 1000L, 5L), processingTs - 1000L)
+    val snapshot = originalHarness.snapshot(21L, processingTs)
+    originalHarness.close()
+
+    val restoredHarness = harness(new GigaTileProcessFunction(groupBy, inputSchema, bufferingOutputTimeMillis = 0L))
+    try {
+      restoredHarness.setup()
+      restoredHarness.initializeState(snapshot)
+      restoredHarness.open()
+      restoredHarness.setProcessingTime(processingTs)
+      advanceToHealthyLiveWatermark(restoredHarness, processingTs)
+      restoredHarness.setProcessingTime(cadenceTs)
+
+      val outputs = restoredHarness.extractOutputValues()
+      outputs should have size 1
+      decodeSum(outputs.get(0)) shouldEqual 5L
+      outputs.get(0).latestTsMillis shouldEqual processingTs
+    } finally restoredHarness.close()
+  }
+
+  it should "repair a cadence marker after a state-blind timer consumer" in {
+    val cadenceMillis = 1000L
+    val cadenceTs = nextBufferedWriteTick(groupBy, entityKey(), processingTs, cadenceMillis)
+    val evictionTs = nextEvictionHop(processingTs)
+    val originalFunction =
+      new GigaTileProcessFunction(groupBy, inputSchema, bufferingOutputTimeMillis = cadenceMillis)
+    val originalHarness = harness(originalFunction)
+    cadenceTs should be < evictionTs
+    originalHarness.open()
+    originalHarness.setProcessingTime(processingTs)
+    advanceToHealthyLiveWatermark(originalHarness, processingTs)
+    originalHarness.processElement1(event(processingTs - 1000L, 5L), processingTs - 1000L)
+    setCurrentKey(originalHarness, entityKey())
+    valueState[java.lang.Boolean](originalFunction, "pendingPublicationState").value() shouldEqual java.lang.Boolean.TRUE
+    valueState[java.lang.Long](originalFunction, "nextProcessingEvictionTimerState").value() should not be null
+    val snapshot = originalHarness.snapshot(23L, processingTs)
+    originalHarness.close()
+
+    // The older binary neither binds the cadence state nor recognizes its physical timer.
+    val legacyHarness = harness(new StateBlindProcessingTimerConsumer)
+    legacyHarness.setup()
+    legacyHarness.initializeState(snapshot)
+    legacyHarness.open()
+    legacyHarness.setProcessingTime(processingTs)
+    legacyHarness.setProcessingTime(cadenceTs)
+    legacyHarness.extractOutputValues() shouldBe empty
+    val legacySnapshot = legacyHarness.snapshot(24L, cadenceTs)
+    legacyHarness.close()
+
+    val restoredFunction =
+      new GigaTileProcessFunction(groupBy, inputSchema, bufferingOutputTimeMillis = cadenceMillis)
+    val restoredHarness = harness(restoredFunction)
+    try {
+      restoredHarness.setup()
+      restoredHarness.initializeState(legacySnapshot)
+      restoredHarness.open()
+      restoredHarness.setProcessingTime(cadenceTs)
+      advanceToHealthyLiveWatermark(restoredHarness, cadenceTs)
+      restoredHarness.processElement1(event(processingTs - 999L, 7L), processingTs - 999L)
+      setCurrentKey(restoredHarness, entityKey())
+      val repairedCadenceTs =
+        valueState[java.lang.Long](restoredFunction, "nextBufferedWriteTimerState").value().longValue()
+      repairedCadenceTs should be > cadenceTs
+      valueState[java.lang.Boolean](restoredFunction, "pendingPublicationState").value() shouldEqual
+        java.lang.Boolean.TRUE
+
+      restoredHarness.setProcessingTime(repairedCadenceTs)
+
+      val outputs = restoredHarness.extractOutputValues()
+      outputs should have size 1
+      decodeSum(outputs.get(0)) shouldEqual 12L
+    } finally restoredHarness.close()
+  }
+
+  it should "flush a restored parked write through activation after buffering is disabled" in {
+    val cadenceMillis = 1000L
+    val function = new GigaTileProcessFunction(groupBy, inputSchema, bufferingOutputTimeMillis = cadenceMillis)
+    val cadenceTs = nextBufferedWriteTick(groupBy, entityKey(), processingTs, cadenceMillis)
+    val catchupThreshold = new Window(5, TimeUnit.MINUTES).millis + FlinkJob.CatchupWatermarkLagSlackMillis
+    val watermark = processingTs - catchupThreshold + (cadenceTs - processingTs) / 2L
+    val originalHarness = harness(function)
+    originalHarness.open()
+    originalHarness.setProcessingTime(processingTs)
+    advanceToLiveWatermark(originalHarness, watermark)
+    originalHarness.processElement1(event(watermark - 1L, 5L), watermark - 1L)
+    originalHarness.setProcessingTime(cadenceTs)
+    setCurrentKey(originalHarness, entityKey())
+    valueState[java.lang.Long](function, "nextBufferedWriteTimerState").value() shouldBe null
+    val snapshot = originalHarness.snapshot(22L, cadenceTs)
+    originalHarness.close()
+
+    val restoredFunction = new GigaTileProcessFunction(groupBy, inputSchema, bufferingOutputTimeMillis = 0L)
+    val restoredHarness = harness(restoredFunction)
+    try {
+      restoredHarness.setup()
+      restoredHarness.initializeState(snapshot)
+      restoredHarness.open()
+      restoredHarness.setProcessingTime(cadenceTs)
+      advanceToHealthyLiveWatermark(restoredHarness, cadenceTs)
+
+      val outputs = restoredHarness.extractOutputValues()
+      outputs should have size 1
+      decodeSum(outputs.get(0)) shouldEqual 5L
+      outputs.get(0).latestTsMillis shouldEqual cadenceTs
+      setCurrentKey(restoredHarness, entityKey())
+      valueState[java.lang.Long](restoredFunction, "bufferedWriteLatestTsState").value() shouldBe null
+      valueState[java.lang.Long](restoredFunction, "nextBufferedWriteTimerState").value() shouldBe null
+    } finally restoredHarness.close()
+  }
+
+  it should "schedule a stale buffered version collision strictly after the cadence callback" in {
+    val cadenceMillis = 1000L
+    val function = new GigaTileProcessFunction(groupBy, inputSchema, bufferingOutputTimeMillis = cadenceMillis)
+    val testHarness = harness(function)
+    val cadenceTs = nextBufferedWriteTick(groupBy, entityKey(), processingTs, cadenceMillis)
+
+    try {
+      testHarness.open()
+      testHarness.setProcessingTime(processingTs)
+      advanceToHealthyLiveWatermark(testHarness, processingTs)
+      testHarness.processElement1(event(processingTs - 1000L, 5L), processingTs - 1000L)
+      setCurrentKey(testHarness, entityKey())
+      valueState[java.lang.Long](function, "lastEmittedVersionState").update(processingTs)
+
+      testHarness.setProcessingTime(cadenceTs)
+
+      testHarness.extractOutputValues() shouldBe empty
+      setCurrentKey(testHarness, entityKey())
+      val collisionTs = valueState[java.lang.Long](function, "pendingVersionCollisionState").value().longValue()
+      collisionTs should be > cadenceTs
+      valueState[java.lang.Boolean](function, "pendingPublicationState").value() shouldEqual
+        java.lang.Boolean.TRUE
+      testHarness.setProcessingTime(collisionTs)
+      decodeSum(testHarness.extractOutputValues().get(0)) shouldEqual 5L
+      setCurrentKey(testHarness, entityKey())
+      valueState[java.lang.Boolean](function, "pendingPublicationState").value() shouldBe null
     } finally testHarness.close()
   }
 
@@ -1351,6 +1818,19 @@ object GigaTileProcessFunctionTest {
   private def nextDay(timestamp: Long): Long = {
     val dayMillis = new Window(1, TimeUnit.DAYS).millis
     TsUtils.round(timestamp, dayMillis) + dayMillis
+  }
+
+  private def nextBufferedWriteTick(
+      phaseGroupBy: GroupBy,
+      key: util.List[Any],
+      currentProcessingTime: Long,
+      cadenceMillis: Long
+  ): Long = {
+    val phase =
+      Math.floorMod((phaseGroupBy.getMetaData.getName :: key.iterator().asScala.toList).hashCode().toLong, cadenceMillis)
+    val elapsedSincePhase = Math.floorMod(Math.floorMod(currentProcessingTime, cadenceMillis) - phase, cadenceMillis)
+    val delay = if (elapsedSincePhase == 0L) cadenceMillis else cadenceMillis - elapsedSincePhase
+    currentProcessingTime + delay
   }
 
   private def currentProcessor(function: GigaTileProcessFunction): GigaTileStreamProcessor = {

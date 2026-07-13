@@ -76,6 +76,8 @@ class ChainedGroupByJob(eventSrc: FlinkSource[ProjectedEvent],
       .getProperty("buffering_output_policy", props, topicInfo)
       .map(MegaTileEmissionPolicy.fromString)
       .getOrElse(MegaTileEmissionPolicy.Default)
+  private val gigaTileBufferingOutputTimeMillis =
+    FlinkUtils.gigaTileBufferingOutputTimeMillis(bufferingOutputTimeMillis, bufferingOutputPolicy)
 
   /** Build the tiled version of the Flink GroupBy job that chains features using a JoinSource.
     *  The operators are structured as follows:
@@ -116,7 +118,14 @@ class ChainedGroupByJob(eventSrc: FlinkSource[ProjectedEvent],
         s"${joinSource.getJoin.getMetaData.getName} using topic: $topic")
     val (processedStream, schema) = buildEnrichedStream(env)
     val batchIrStream = BatchIrSourceBuilder.build(env, groupByServingInfoParsed, props)
-    buildGigaTiledTail(processedStream, batchIrStream, schema, parallelism, sinkFn, kvStoreCapacity, enableDebug)
+    buildGigaTiledTail(processedStream,
+                       batchIrStream,
+                       schema,
+                       parallelism,
+                       sinkFn,
+                       kvStoreCapacity,
+                       enableDebug,
+                       gigaTileBufferingOutputTimeMillis)
   }
 
   /** Build the source → watermark → enrichment → query transform pipeline.

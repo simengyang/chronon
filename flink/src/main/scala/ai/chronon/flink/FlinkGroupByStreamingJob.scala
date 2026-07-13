@@ -56,6 +56,8 @@ class FlinkGroupByStreamingJob(eventSrc: FlinkSource[ProjectedEvent],
       .getProperty("buffering_output_policy", props, topicInfo)
       .map(MegaTileEmissionPolicy.fromString)
       .getOrElse(MegaTileEmissionPolicy.Default)
+  private val gigaTileBufferingOutputTimeMillis =
+    FlinkUtils.gigaTileBufferingOutputTimeMillis(bufferingOutputTimeMillis, bufferingOutputPolicy)
 
   // The source of our Flink application is a  topic
   val topic: String = groupByServingInfoParsed.groupBy.streamingSource.get.topic
@@ -152,7 +154,14 @@ class FlinkGroupByStreamingJob(eventSrc: FlinkSource[ProjectedEvent],
     logger.info(f"Running Giga Tiled (push) Flink job for groupByName=${groupByName}, Topic=${topic}.")
     val preparedStream = buildSourceStream(env)
     val batchIrStream = BatchIrSourceBuilder.build(env, groupByServingInfoParsed, props)
-    buildGigaTiledTail(preparedStream, batchIrStream, inputSchema, parallelism, sinkFn, kvStoreCapacity, enableDebug)
+    buildGigaTiledTail(preparedStream,
+                       batchIrStream,
+                       inputSchema,
+                       parallelism,
+                       sinkFn,
+                       kvStoreCapacity,
+                       enableDebug,
+                       gigaTileBufferingOutputTimeMillis)
   }
 
   private def buildSourceStream(env: StreamExecutionEnvironment): DataStream[ProjectedEvent] = {

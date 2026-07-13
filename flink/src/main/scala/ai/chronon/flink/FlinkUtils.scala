@@ -1,5 +1,6 @@
 package ai.chronon.flink
 
+import ai.chronon.flink.window.MegaTileEmissionPolicy
 import ai.chronon.online.TopicInfo
 
 import scala.concurrent.ExecutionContext
@@ -63,6 +64,12 @@ object FlinkUtils {
       }
       .getOrElse(0L)
   }
+
+  def gigaTileBufferingOutputTimeMillis(
+      configuredMillis: Long,
+      emissionPolicy: MegaTileEmissionPolicy
+  ): Long =
+    if (emissionPolicy == MegaTileEmissionPolicy.WallClockCadence) configuredMillis else 0L
 }
 
 /** This was moved to flink-rpc-akka in Flink 1.16 and made private, so we reproduce the direct execution context here

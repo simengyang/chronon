@@ -604,7 +604,7 @@ class GigaTileStreamProcessor(
     packed
   }
 
-  private[windowing] def packAndFinalize(): Array[Any] = windowedAgg.finalize(pack())
+  private[chronon] def packAndFinalize(): Array[Any] = windowedAgg.finalize(pack())
 
   /** Snapshot the current value without moving either aggregation clock. */
   private[chronon] def currentSnapshot: GigaEmitResult = {
