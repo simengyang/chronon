@@ -30,7 +30,7 @@ import java.util
   * - GigaTileProcessFunction (CoProcessFunction) with connected streams
   * - FlinkGigaTileStore with real Flink keyed state (ValueState/MapState)
   * - Key switching across entities
-  * - Timer registration and event-time eviction
+  * - Timer registration and processing-time eviction
   * - GigaTileAvroCodecFn output encoding
   *
   * Does NOT test Iceberg source (requires a real Iceberg catalog).
@@ -143,12 +143,13 @@ class GigaTilePushFlinkIntegrationTest extends AnyFlatSpec with BeforeAndAfter {
 
   it should "process events through GigaTileProcessFunction and emit finalized vectors" in {
     implicit val env: StreamExecutionEnvironment = StreamExecutionEnvironment.getExecutionEnvironment
+    val now = System.currentTimeMillis()
 
     // 3 events across 2 entities. Each entity should produce at least one finalized vector.
     val elements = Seq(
-      E2ETestEvent("test1", 12, 1.5, 1699366993123L),
-      E2ETestEvent("test2", 13, 1.6, 1699366993124L),
-      E2ETestEvent("test1", 14, 2.5, 1699366993125L)
+      E2ETestEvent("test1", 12, 1.5, now - 3000L),
+      E2ETestEvent("test2", 13, 1.6, now - 2000L),
+      E2ETestEvent("test1", 14, 2.5, now - 1000L)
     )
 
     val groupBy = makePushGroupBy(Seq("id"))
@@ -159,15 +160,12 @@ class GigaTilePushFlinkIntegrationTest extends AnyFlatSpec with BeforeAndAfter {
 
     val results = CollectSink.values.toScala
 
-    // Each event should trigger an emit (finalized vector)
-    results.size should be >= elements.size
-
     // All writes should succeed
     results.forall(_.status) shouldBe true
 
-    // Both entities should have output
-    val keyBytes = results.map(_.keyBytes).distinct
-    keyBytes.size should be >= 2
+    // Same-millisecond updates may be coalesced, but every entity must publish final state.
+    val keyHashes = results.map(result => util.Arrays.hashCode(result.keyBytes)).distinct
+    keyHashes.size shouldBe 2
 
     // Value bytes should be non-empty (finalized vector encoded)
     results.foreach { wr =>
@@ -177,11 +175,12 @@ class GigaTilePushFlinkIntegrationTest extends AnyFlatSpec with BeforeAndAfter {
 
   it should "produce decodable finalized vectors" in {
     implicit val env: StreamExecutionEnvironment = StreamExecutionEnvironment.getExecutionEnvironment
+    val now = System.currentTimeMillis()
 
     // Single entity, known values
     val elements = Seq(
-      E2ETestEvent("entity1", 10, 5.0, 1699366993100L),
-      E2ETestEvent("entity1", 20, 3.0, 1699366993200L)
+      E2ETestEvent("entity1", 10, 5.0, now - 2000L),
+      E2ETestEvent("entity1", 20, 3.0, now - 1000L)
     )
 
     val groupBy = makePushGroupBy(Seq("id"))
@@ -194,9 +193,8 @@ class GigaTilePushFlinkIntegrationTest extends AnyFlatSpec with BeforeAndAfter {
     results should not be empty
     results.forall(_.status) shouldBe true
 
-    // The pipeline now decays idle entities via re-registered eviction timers, so the
-    // tsMillis-latest emit at end-of-stream is a tombstone (all-null). Pick the latest
-    // emit whose SUM is non-null to verify the aggregation itself is correct.
+    // Processing-time freshness gates events against the current wall clock, so these test
+    // rows are intentionally recent rather than fixed historical timestamps.
     val sumFieldName = servingInfo.outputCodec.decodeMap(results.head.valueBytes).keys
       .find(_.contains("double_val")).get
     val nonEmpty = results.toSeq.flatMap { wr =>
@@ -210,12 +208,13 @@ class GigaTilePushFlinkIntegrationTest extends AnyFlatSpec with BeforeAndAfter {
 
   it should "handle multiple entities with correct key isolation" in {
     implicit val env: StreamExecutionEnvironment = StreamExecutionEnvironment.getExecutionEnvironment
+    val now = System.currentTimeMillis()
 
     // Two entities with different values — verify state isolation
     val elements = Seq(
-      E2ETestEvent("alice", 1, 10.0, 1699366993100L),
-      E2ETestEvent("bob", 2, 20.0, 1699366993200L),
-      E2ETestEvent("alice", 3, 5.0, 1699366993300L)
+      E2ETestEvent("alice", 1, 10.0, now - 3000L),
+      E2ETestEvent("bob", 2, 20.0, now - 2000L),
+      E2ETestEvent("alice", 3, 5.0, now - 1000L)
     )
 
     val groupBy = makePushGroupBy(Seq("id"))
@@ -228,10 +227,7 @@ class GigaTilePushFlinkIntegrationTest extends AnyFlatSpec with BeforeAndAfter {
     results should not be empty
     results.forall(_.status) shouldBe true
 
-    // Group by key and pick the latest non-empty write per entity. Idle decay timers fire
-    // at end-of-stream and tombstone each key with an all-null vector after 1d window
-    // expiration; the test verifies the SUM aggregation, not the decay, so filter to non-
-    // null sums per key.
+    // Group by key and pick the latest non-empty write per entity.
     val sumFieldName = servingInfo.outputCodec.decodeMap(results.head.valueBytes).keys
       .find(_.contains("double_val")).get
     val latestSumPerKey: Set[Double] = results

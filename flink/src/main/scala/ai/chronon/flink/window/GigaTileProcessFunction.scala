@@ -11,6 +11,7 @@ import ai.chronon.online.serde.ArrayRow
 import org.apache.flink.api.common.state.{MapState, MapStateDescriptor, ValueState, ValueStateDescriptor}
 import org.apache.flink.configuration.Configuration
 import org.apache.flink.metrics.Counter
+import org.apache.flink.streaming.api.{TimeDomain, TimerService}
 import org.apache.flink.streaming.api.functions.co.KeyedCoProcessFunction
 import org.apache.flink.util.Collector
 import org.slf4j.{Logger, LoggerFactory}
@@ -55,6 +56,9 @@ class GigaTileProcessFunction(
   private var batchIrState: ValueState[Array[Byte]] = _
   private var batchEndTsState: ValueState[java.lang.Long] = _
   private var runningLargeIrState: ValueState[Array[Byte]] = _
+  private var nextProcessingEvictionTimerState: ValueState[java.lang.Long] = _
+  private var lastEmittedVersionState: ValueState[java.lang.Long] = _
+  private var pendingVersionCollisionState: ValueState[java.lang.Long] = _
 
   override def open(parameters: Configuration): Unit = {
     super.open(parameters)
@@ -70,10 +74,9 @@ class GigaTileProcessFunction(
     megaTileIrState =
       getRuntimeContext.getState(new ValueStateDescriptor[Array[Byte]]("giga-tile-ir", classOf[Array[Byte]]))
     dailyLargeIrState = getRuntimeContext.getMapState(
-      new MapStateDescriptor[java.lang.Long, Array[Byte]](
-        "giga-tile-large-daily",
-        classOf[java.lang.Long],
-        classOf[Array[Byte]]))
+      new MapStateDescriptor[java.lang.Long, Array[Byte]]("giga-tile-large-daily",
+                                                          classOf[java.lang.Long],
+                                                          classOf[Array[Byte]]))
     currentDayStartState = getRuntimeContext.getState(
       new ValueStateDescriptor[java.lang.Long]("giga-tile-day-start", classOf[java.lang.Long]))
     earliestTileStartState = getRuntimeContext.getState(
@@ -82,8 +85,14 @@ class GigaTileProcessFunction(
       getRuntimeContext.getState(new ValueStateDescriptor[Array[Byte]]("giga-tile-batch-ir", classOf[Array[Byte]]))
     batchEndTsState = getRuntimeContext.getState(
       new ValueStateDescriptor[java.lang.Long]("giga-tile-batch-end", classOf[java.lang.Long]))
-    runningLargeIrState = getRuntimeContext.getState(
-      new ValueStateDescriptor[Array[Byte]]("giga-tile-running-large", classOf[Array[Byte]]))
+    runningLargeIrState =
+      getRuntimeContext.getState(new ValueStateDescriptor[Array[Byte]]("giga-tile-running-large", classOf[Array[Byte]]))
+    nextProcessingEvictionTimerState = getRuntimeContext.getState(
+      new ValueStateDescriptor[java.lang.Long]("giga-tile-next-evict-pt-timer", classOf[java.lang.Long]))
+    lastEmittedVersionState = getRuntimeContext.getState(
+      new ValueStateDescriptor[java.lang.Long]("giga-tile-last-emitted-version", classOf[java.lang.Long]))
+    pendingVersionCollisionState = getRuntimeContext.getState(
+      new ValueStateDescriptor[java.lang.Long]("giga-tile-pending-version-collision", classOf[java.lang.Long]))
 
     initializeTransients()
   }
@@ -106,10 +115,181 @@ class GigaTileProcessFunction(
     if (lastKey == null || !lastKey.equals(currentKey)) {
       lastKey = currentKey
       flinkStore.bindFlinkState(
-        tileState, megaTileIrState, dailyLargeIrState,
-        currentDayStartState, earliestTileStartState,
-        batchIrState, batchEndTsState, runningLargeIrState
+        tileState,
+        megaTileIrState,
+        dailyLargeIrState,
+        currentDayStartState,
+        earliestTileStartState,
+        batchIrState,
+        batchEndTsState,
+        runningLargeIrState
       )
+    }
+  }
+
+  /** Processing-time callbacks can share a millisecond. Coalesce later same-millisecond updates
+    * behind a timer so emitted versions are strictly increasing before async sink handoff.
+    */
+  private def emitOrCoalesceVersionCollision(
+      timerService: TimerService,
+      finalizedVector: Array[Any],
+      currentKey: java.util.List[Any],
+      versionMillis: Long,
+      startProcessingTimeMillis: Long,
+      out: Collector[TimestampedTile]
+  ): Unit = {
+    if (finalizedVector == null) return
+
+    val lastEmittedVersion = lastEmittedVersionState.value()
+    if (
+      pendingVersionCollisionState.value() != null ||
+      (lastEmittedVersion != null && versionMillis <= lastEmittedVersion.longValue())
+    ) {
+      scheduleVersionCollisionFlushIfNeeded(timerService, lastEmittedVersion)
+    } else {
+      try {
+        out.collect(
+          new TimestampedTile(currentKey,
+                              gigaTileCodec.encodeOutput(finalizedVector),
+                              versionMillis,
+                              startProcessingTimeMillis))
+        lastEmittedVersionState.update(versionMillis)
+      } catch {
+        case e: Exception =>
+          // State was already mutated. Retry the current snapshot on a future timer so a
+          // transient first-write failure cannot leave the key unpublished.
+          scheduleVersionCollisionFlushIfNeeded(timerService, lastEmittedVersion)
+          throw e
+      }
+    }
+  }
+
+  private def scheduleVersionCollisionFlushIfNeeded(
+      timerService: TimerService,
+      lastEmittedVersion: java.lang.Long
+  ): Unit = {
+    val currentProcessingTime = timerService.currentProcessingTime()
+    if (
+      pendingVersionCollisionState.value() == null && currentProcessingTime < Long.MaxValue &&
+      (lastEmittedVersion == null || lastEmittedVersion.longValue() < Long.MaxValue)
+    ) {
+      val flushVersion =
+        if (lastEmittedVersion == null) currentProcessingTime + 1L
+        else math.max(lastEmittedVersion.longValue() + 1L, currentProcessingTime + 1L)
+      timerService.registerProcessingTimeTimer(flushVersion)
+      pendingVersionCollisionState.update(flushVersion)
+    }
+  }
+
+  private def isCurrentVersionCollisionTimer(timestamp: Long): Boolean =
+    Option(pendingVersionCollisionState.value()).exists(_.longValue() == timestamp)
+
+  private def processingTimerMarkerIsExpired(
+      markerTimestamp: Long,
+      currentProcessingTime: Long,
+      currentTimerCallback: Option[(TimeDomain, Long)]
+  ): Boolean =
+    currentTimerCallback match {
+      case None => markerTimestamp <= currentProcessingTime
+      // Flink exposes the jump target as currentProcessingTime while draining every due
+      // timer in timestamp order. A later marker is still physically queued; only a marker
+      // before this callback can have been consumed without clearing its ownership state.
+      case Some((TimeDomain.PROCESSING_TIME, callbackTimestamp)) => markerTimestamp < callbackTimestamp
+      case Some((TimeDomain.EVENT_TIME, _))                      => false
+    }
+
+  private def isCurrentProcessingTimerCallback(
+      timestamp: Long,
+      currentTimerCallback: Option[(TimeDomain, Long)]
+  ): Boolean =
+    currentTimerCallback.contains(TimeDomain.PROCESSING_TIME -> timestamp)
+
+  /** An older binary can consume additive processing-time timers without clearing their
+    * keyed ownership markers. Repair expired ownership on the next keyed callback. This
+    * cannot repair a completely idle key because a KeyedCoProcessFunction cannot enumerate
+    * keyed state during open; rolling back below this timer-aware layer still requires a
+    * retained compatible checkpoint or a state migration.
+    */
+  private def repairExpiredProcessingTimerMarkers(
+      timerService: TimerService,
+      currentProcessingTime: Long,
+      currentTimerCallback: Option[(TimeDomain, Long)]
+  ): Unit = {
+    val trackedEviction = nextProcessingEvictionTimerState.value()
+    if (
+      trackedEviction != null && processingTimerMarkerIsExpired(trackedEviction.longValue(),
+                                                                currentProcessingTime,
+                                                                currentTimerCallback)
+    ) {
+      nextProcessingEvictionTimestamp(currentProcessingTime) match {
+        case Some(nextEviction) =>
+          // Register first. If registration fails, leave the stale marker visible so a later
+          // callback can retry instead of recording ownership with no physical timer.
+          timerService.registerProcessingTimeTimer(nextEviction)
+          nextProcessingEvictionTimerState.update(nextEviction)
+        case None => nextProcessingEvictionTimerState.clear()
+      }
+    }
+
+    val trackedCollision = pendingVersionCollisionState.value()
+    if (
+      trackedCollision != null && processingTimerMarkerIsExpired(trackedCollision.longValue(),
+                                                                 currentProcessingTime,
+                                                                 currentTimerCallback)
+    ) {
+      val sharedEviction = Option(nextProcessingEvictionTimerState.value())
+        .map(_.longValue())
+        .filterNot(processingTimerMarkerIsExpired(_, currentProcessingTime, currentTimerCallback))
+      val nextCollision = sharedEviction.orElse {
+        val lastEmittedVersion = lastEmittedVersionState.value()
+        if (
+          currentProcessingTime == Long.MaxValue ||
+          (lastEmittedVersion != null && lastEmittedVersion.longValue() == Long.MaxValue)
+        ) None
+        else {
+          val afterLast = if (lastEmittedVersion == null) Long.MinValue else lastEmittedVersion.longValue() + 1L
+          Some(math.max(currentProcessingTime + 1L, afterLast))
+        }
+      }
+      nextCollision match {
+        case Some(timestamp) =>
+          // If the collision joins the callback currently being drained, role discovery below
+          // will consume it in this invocation. Re-registering that timestamp would enqueue an
+          // unnecessary immediate duplicate after Flink has removed the physical timer.
+          if (!isCurrentProcessingTimerCallback(timestamp, currentTimerCallback)) {
+            timerService.registerProcessingTimeTimer(timestamp)
+          }
+          pendingVersionCollisionState.update(timestamp)
+        case None => pendingVersionCollisionState.clear()
+      }
+    }
+  }
+
+  private def flushVersionCollision(
+      timerService: TimerService,
+      currentProcessingTime: Long,
+      currentKey: java.util.List[Any],
+      out: Collector[TimestampedTile]
+  ): Unit = {
+    try {
+      val pendingVersion = pendingVersionCollisionState.value()
+      if (pendingVersion == null) return
+
+      val snapshot = processor.currentSnapshot
+      val encoded = gigaTileCodec.encodeOutput(snapshot.finalizedVector)
+      out.collect(new TimestampedTile(currentKey, encoded, pendingVersion.longValue(), System.currentTimeMillis()))
+      lastEmittedVersionState.update(pendingVersion)
+      pendingVersionCollisionState.clear()
+    } catch {
+      case e: Exception =>
+        // The fired timer was the only flush trigger. Re-arm before the outer handler records
+        // the failure so a transient encoding/collection error cannot strand the latest value.
+        if (currentProcessingTime < Long.MaxValue) {
+          val retryVersion = currentProcessingTime + 1L
+          timerService.registerProcessingTimeTimer(retryVersion)
+          pendingVersionCollisionState.update(retryVersion)
+        }
+        throw e
     }
   }
 
@@ -129,19 +309,21 @@ class GigaTileProcessFunction(
       val row = new ArrayRow(values, tsMills)
 
       ensureStateBound(ctx.getCurrentKey)
-      processor.advanceWatermark(ctx.timerService().currentWatermark())
-      val result = processor.onEvent(row, tsMills)
+      val timerService = ctx.timerService()
+      val currentProcessingTime = timerService.currentProcessingTime()
+      repairExpiredProcessingTimerMarkers(timerService, currentProcessingTime, None)
+      val rolloverResult = processor.advanceWatermark(currentProcessingTime)
+      val eventResult = processor.onEvent(row, tsMills, currentProcessingTime)
+      val result = if (eventResult.finalizedVector != null) eventResult else rolloverResult
 
-      if (result.finalizedVector != null) {
-        out.collect(
-          new TimestampedTile(ctx.getCurrentKey,
-                              gigaTileCodec.encodeOutput(result.finalizedVector),
-                              tsMills,
-                              event.startProcessingTimeMillis))
-      }
+      scheduleProcessingEvictionTimerIfNeeded(timerService, currentProcessingTime)
+      emitOrCoalesceVersionCollision(timerService,
+                                     result.finalizedVector,
+                                     ctx.getCurrentKey,
+                                     currentProcessingTime,
+                                     event.startProcessingTimeMillis,
+                                     out)
 
-      val nextEviction = TsUtils.round(tsMills, processor.minEvictionInterval) + processor.minEvictionInterval
-      ctx.timerService().registerEventTimeTimer(nextEviction)
     } catch {
       case e: Exception =>
         logger.error(s"Error processing giga tile event for groupBy=${groupBy.getMetaData.getName}", e)
@@ -159,27 +341,26 @@ class GigaTileProcessFunction(
       if (processor == null) initializeTransients()
 
       ensureStateBound(ctx.getCurrentKey)
-      processor.advanceWatermark(ctx.timerService().currentWatermark())
+      val timerService = ctx.timerService()
+      val currentProcessingTime = timerService.currentProcessingTime()
+      repairExpiredProcessingTimerMarkers(timerService, currentProcessingTime, None)
+      val rolloverResult = processor.advanceWatermark(currentProcessingTime)
 
       val batchIr = gigaTileCodec.decodeBatchIr(batchRow.valueBytes)
-      val result = processor.onBatchUpdate(batchIr, batchRow.batchEndTs,
-        ctx.timerService().currentWatermark())
+      val batchResult = processor.onBatchUpdate(batchIr, batchRow.batchEndTs, currentProcessingTime)
+      val result = if (batchResult.finalizedVector != null) batchResult else rolloverResult
 
       batchUpdateCounter.inc()
 
-      if (result.finalizedVector != null) {
-        out.collect(
-          new TimestampedTile(ctx.getCurrentKey,
-                              gigaTileCodec.encodeOutput(result.finalizedVector),
-                              batchRow.batchEndTs,
-                              System.currentTimeMillis()))
+      if (batchResult.needsEvictionTimer) {
+        scheduleProcessingEvictionTimerIfNeeded(timerService, currentProcessingTime)
       }
-
-      if (result.needsEvictionTimer) {
-        val nextEviction = TsUtils.round(ctx.timerService().currentWatermark(),
-          processor.minEvictionInterval) + processor.minEvictionInterval
-        ctx.timerService().registerEventTimeTimer(nextEviction)
-      }
+      emitOrCoalesceVersionCollision(timerService,
+                                     result.finalizedVector,
+                                     ctx.getCurrentKey,
+                                     currentProcessingTime,
+                                     System.currentTimeMillis(),
+                                     out)
     } catch {
       case e: Exception =>
         logger.error(s"Error processing batch IR for groupBy=${groupBy.getMetaData.getName}", e)
@@ -192,39 +373,122 @@ class GigaTileProcessFunction(
       ctx: KeyedCoProcessFunction[java.util.List[Any], ProjectedEvent, BatchIrRow, TimestampedTile]#OnTimerContext,
       out: Collector[TimestampedTile]
   ): Unit = {
+    var timerServiceOnFailure: TimerService = null
+    var processingTimeOnFailure = Long.MinValue
+    var evictionTimerFired = false
+    var versionCollisionTimerFired = false
     try {
       if (processor == null) initializeTransients()
 
       ensureStateBound(ctx.getCurrentKey)
-      processor.advanceWatermark(ctx.timerService().currentWatermark())
-      val result = processor.onScheduledEviction(timestamp)
+      val timerService = ctx.timerService()
+      val currentProcessingTime = timerService.currentProcessingTime()
+      timerServiceOnFailure = timerService
+      processingTimeOnFailure = currentProcessingTime
+      repairExpiredProcessingTimerMarkers(timerService, currentProcessingTime, Some(ctx.timeDomain() -> timestamp))
 
-      if (result.finalizedVector != null) {
-        out.collect(
-          new TimestampedTile(ctx.getCurrentKey,
-                              gigaTileCodec.encodeOutput(result.finalizedVector),
-                              timestamp,
-                              System.currentTimeMillis()))
+      // Checkpoints written by the event-time implementation may still contain several
+      // event-time eviction timers per key. Let those callbacks migrate the key to one
+      // processing-time timer, but do not publish from both timer domains.
+      if (ctx.timeDomain() == TimeDomain.EVENT_TIME) {
+        scheduleProcessingEvictionTimerIfNeeded(timerService, currentProcessingTime)
+        return
       }
 
-      // Re-register the next eviction timer so idle keys keep decaying without waiting for
-      // a new event. The natural termination is `result.isEmpty`: once every column has
-      // decayed to null there's nothing more to correct, and no new timer is needed until a
-      // fresh event arrives. Without re-registration, an entity that goes silent serves the
-      // last emit forever — even after every event has aged out of every window.
-      if (!result.isEmpty) {
-        val interval = processor.minEvictionInterval
-        // Guard against integer overflow at end-of-stream (watermark = Long.MaxValue): if
-        // the next timer would wrap into the negative range, skip — Flink would either
-        // refuse the registration or fire it immediately, looping forever.
-        if (timestamp <= Long.MaxValue - interval) {
-          ctx.timerService().registerEventTimeTimer(timestamp + interval)
+      if (ctx.timeDomain() != TimeDomain.PROCESSING_TIME) {
+        return
+      }
+
+      val isEvictionTimer = isCurrentProcessingEvictionTimer(timestamp)
+      val isVersionCollisionTimer = isCurrentVersionCollisionTimer(timestamp)
+      evictionTimerFired = isEvictionTimer
+      versionCollisionTimerFired = isVersionCollisionTimer
+      if (!isEvictionTimer && !isVersionCollisionTimer) return
+
+      var finalizedVector: Array[Any] = null
+      if (isEvictionTimer) {
+        nextProcessingEvictionTimerState.clear()
+        val rolloverResult = processor.advanceWatermark(currentProcessingTime)
+        val evictionResult = processor.onScheduledEviction(currentProcessingTime)
+        finalizedVector =
+          if (evictionResult.finalizedVector != null) evictionResult.finalizedVector else rolloverResult.finalizedVector
+
+        // Re-register before a coincident collision flush: if encoding the flush fails, both
+        // the retry and normal eviction cadence remain live.
+        if (!evictionResult.isEmpty) {
+          scheduleProcessingEvictionTimerIfNeeded(timerService, currentProcessingTime)
         }
+      }
+
+      if (isVersionCollisionTimer) {
+        // Eviction wins when both timers share a timestamp; publish one post-eviction snapshot.
+        flushVersionCollision(timerService, currentProcessingTime, ctx.getCurrentKey, out)
+      } else {
+        emitOrCoalesceVersionCollision(timerService,
+                                       finalizedVector,
+                                       ctx.getCurrentKey,
+                                       currentProcessingTime,
+                                       System.currentTimeMillis(),
+                                       out)
       }
     } catch {
       case e: Exception =>
+        if (timerServiceOnFailure != null) {
+          val trackedEviction = nextProcessingEvictionTimerState.value()
+          if (
+            evictionTimerFired &&
+            (trackedEviction == null || trackedEviction.longValue() <= timestamp)
+          ) {
+            nextProcessingEvictionTimerState.clear()
+            scheduleProcessingEvictionTimerIfNeeded(timerServiceOnFailure, processingTimeOnFailure)
+          }
+          val pendingCollision = pendingVersionCollisionState.value()
+          if (
+            versionCollisionTimerFired && pendingCollision != null &&
+            pendingCollision.longValue() <= timestamp && processingTimeOnFailure < Long.MaxValue
+          ) {
+            // A shared callback must preserve eviction-before-publication ordering. If
+            // eviction failed, park the collision on the re-armed eviction timer instead
+            // of publishing the stale pre-eviction snapshot one millisecond later.
+            val retryVersion =
+              if (evictionTimerFired) {
+                Option(nextProcessingEvictionTimerState.value())
+                  .map(_.longValue())
+                  .filter(_ > timestamp)
+                  .getOrElse(processingTimeOnFailure + 1L)
+              } else {
+                processingTimeOnFailure + 1L
+              }
+            timerServiceOnFailure.registerProcessingTimeTimer(retryVersion)
+            pendingVersionCollisionState.update(retryVersion)
+          }
+        }
         logger.error(s"Error in giga tile eviction for groupBy=${groupBy.getMetaData.getName}", e)
         eventProcessingErrorCounter.inc()
+    }
+  }
+
+  private def isCurrentProcessingEvictionTimer(timestamp: Long): Boolean =
+    Option(nextProcessingEvictionTimerState.value()).exists(_.longValue() == timestamp)
+
+  private def nextProcessingEvictionTimestamp(currentProcessingTime: Long): Option[Long] = {
+    val interval = processor.minEvictionInterval
+    if (currentProcessingTime <= Long.MaxValue - interval) {
+      Some(TsUtils.round(currentProcessingTime, interval) + interval)
+    } else {
+      None
+    }
+  }
+
+  private def scheduleProcessingEvictionTimerIfNeeded(
+      timerService: TimerService,
+      currentProcessingTime: Long
+  ): Unit = {
+    if (nextProcessingEvictionTimerState.value() == null) {
+      nextProcessingEvictionTimestamp(currentProcessingTime).foreach { nextEviction =>
+        timerService.registerProcessingTimeTimer(nextEviction)
+        nextProcessingEvictionTimerState.update(nextEviction)
+      }
     }
   }
 }

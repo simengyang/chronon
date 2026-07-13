@@ -182,24 +182,34 @@ class GigaTileStreamProcessor(
     else GigaEmitResult(null, droppedStaleEvent = droppedStaleEvent)
   }
 
-  /** Watermark-driven day transition. Updates currentDayStart and rebuilds the small-window
+  /** As-of-driven day transition. Updates currentDayStart and rebuilds the small-window
     * cache because each column's effectiveStart shifts with the new as-of horizon. Daily
     * large-IR slots are unaffected — they're keyed by day-start and persist across rollovers
     * until batch covers them.
     */
-  def advanceWatermark(watermarkTs: Long): Unit = {
+  def advanceWatermark(watermarkTs: Long): GigaEmitResult = {
     val currentDayStart = store.getCurrentDayStart
-    if (currentDayStart == -1L) return
+    if (currentDayStart == -1L) return GigaEmitResult(null)
     val wmDay = TsUtils.round(watermarkTs, DayMillis)
     if (wmDay > currentDayStart) {
       val isAdjacentRollover = wmDay == currentDayStart + DayMillis
       store.putCurrentDayStart(wmDay)
-      // Rebuild only on the adjacent-day case Bug B targets. Multi-day jumps and end-of-stream
+      // Rebuild only on an adjacent-day transition. Multi-day jumps and end-of-stream
       // (watermark = MAX) push the as-of so far past retained tiles that everything would be
       // marked stale and the cache cleared — emitting a spurious null that would overwrite the
-      // PUSH KV row. Leave those cases to the next event-time eviction at a sane timer ts.
-      if (isAdjacentRollover) rebuildCachedSmallWindowIr(watermarkTs, wmDay)
+      // PUSH KV row. Leave those cases to the next eviction at a sane timer timestamp.
+      if (isAdjacentRollover && hasSmallWindows) {
+        val previousPackedIr = windowedAgg.clone(pack())
+        rebuildCachedSmallWindowIr(watermarkTs, wmDay)
+        val packed = pack()
+        val packedIsEmpty = isAllNull(packed)
+        val previousWasEmpty = isAllNull(previousPackedIr)
+        if (!((packedIsEmpty && previousWasEmpty) || irEqual(previousPackedIr, packed))) {
+          return GigaEmitResult(windowedAgg.finalize(packed), isEmpty = packedIsEmpty)
+        }
+      }
     }
+    GigaEmitResult(null)
   }
 
   /** Direct eviction/serve-as-of: corrects small window sawtooth and large window tail selection. */
@@ -395,8 +405,10 @@ class GigaTileStreamProcessor(
         val windowMillis = megaTileAgg.columnWindowMillis(col)
         if (!isNoBatch(col) && windowMillis > 0) {
           val collapsedExpiry = addIfNoOverflow(batchEndTs, windowMillis)
-          if (batchIr.collapsed != null && col < batchIr.collapsed.length &&
-              batchIr.collapsed(col) != null && crossedSincePreviousTimer(queryTs, collapsedExpiry)) {
+          if (
+            batchIr.collapsed != null && col < batchIr.collapsed.length &&
+            batchIr.collapsed(col) != null && crossedSincePreviousTimer(queryTs, collapsedExpiry)
+          ) {
             return true
           }
 
@@ -590,6 +602,12 @@ class GigaTileStreamProcessor(
   }
 
   private[windowing] def packAndFinalize(): Array[Any] = windowedAgg.finalize(pack())
+
+  /** Snapshot the current value without moving either aggregation clock. */
+  private[chronon] def currentSnapshot: GigaEmitResult = {
+    val packed = pack()
+    GigaEmitResult(windowedAgg.finalize(packed), isEmpty = isAllNull(packed))
+  }
 
   /** Strip tail hops that are only used by small windows to reduce state size.
     * 5-min hops for ≤12h windows are never consumed by mergeTailHopsForBatchColumns.

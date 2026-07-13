@@ -281,7 +281,9 @@ class GigaTileBugRegressionTest extends AnyFlatSpec {
 
     // Roll over — wall clock has moved to day+1, three hours past midnight.
     val day1_3h = baseDay + DayMillis + 3 * HourMillis
-    processor.advanceWatermark(day1_3h)
+    val rollover = processor.advanceWatermark(day1_3h)
+    assertNotNull("day rollover should surface the cache correction", rollover.finalizedVector)
+    assertNull("expired values should be removed at rollover", rollover.finalizedVector(0))
 
     // Single fresh event 55 minutes later. Only this event lies inside the 1h horizon now.
     val day1_3h_55m = day1_3h + 55 * MinuteMillis
