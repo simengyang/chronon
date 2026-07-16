@@ -283,9 +283,13 @@ object FlinkJob {
 
   val CatchupWatermarkLagSlackMillis: Long = 30 * 1000L
 
-  // The event-source watermark intentionally trails the newest observed event by
-  // AllowedOutOfOrderness. Publication is safe once only that expected lag plus a small
-  // operational slack remains; aggregation hop sizes do not describe source readiness.
+  // The event-source watermark already trails the newest observed event by AllowedOutOfOrderness
+  // (Flink emits maxEventTs - ooo - 1). Because this tolerance also includes AllowedOutOfOrderness,
+  // that term cancels in the Live check `processingTime > watermark + tolerance`: publication flips
+  // to Live once the true ingestion lag beyond the ooo-trailing is within CatchupWatermarkLagSlackMillis.
+  // AllowedOutOfOrderness is therefore included only to offset the watermark's own trailing, not as an
+  // independent readiness knob; only the slack governs the gate. Aggregation hop sizes do not describe
+  // source readiness.
   val LiveWatermarkLagToleranceMillis: Long =
     AllowedOutOfOrderness.toMillis + CatchupWatermarkLagSlackMillis
 
