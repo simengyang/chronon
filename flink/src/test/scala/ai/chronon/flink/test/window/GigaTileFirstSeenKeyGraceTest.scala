@@ -436,6 +436,83 @@ class GigaTileFirstSeenKeyGraceTest extends AnyFlatSpec with Matchers {
     } finally restoredHarness.close()
   }
 
+  it should "reconcile every key's synthetic baseline after a marker-blind rollback checkpoint" in {
+    // Regression: the per-key rollback reconciliation must run for every key on the subtask,
+    // not only the first callback that seeds the operator-wide grace clock. Two keys both hold a
+    // published synthetic baseline; a marker-blind binary serves the null correction for both and
+    // clears their pending markers; on roll-forward both must drop the stale synthetic baseline.
+    val graceMillis = 1L
+    val firstKey = "entity-a"
+    val secondKey = "entity-b"
+    val startProcessingTime = tenDays + oneHour
+    val eventTime = startProcessingTime - 1000L
+    val originalFunction = new GigaTileProcessFunction(batchBackedGroupBy,
+                                                       inputSchema,
+                                                       firstSeenKeyGraceMillis = graceMillis)
+    val originalHarness = harness(originalFunction)
+    originalHarness.open()
+    originalHarness.setProcessingTime(startProcessingTime)
+    advanceConnectedHealthyLiveWatermark(originalHarness, startProcessingTime)
+    originalHarness.processElement1(event(firstKey, eventTime, 5L), eventTime)
+    originalHarness.processElement1(event(secondKey, eventTime, 9L), eventTime)
+    val baselineProcessingTime = startProcessingTime + graceMillis + 1L
+    originalHarness.setProcessingTime(baselineProcessingTime)
+    advanceConnectedHealthyLiveWatermark(originalHarness, baselineProcessingTime)
+    originalHarness.processElement1(event(firstKey, eventTime + 1L, 0L), eventTime + 1L)
+    originalHarness.processElement1(event(secondKey, eventTime + 1L, 0L), eventTime + 1L)
+
+    Seq(firstKey, secondKey).foreach { key =>
+      setCurrentKey(originalHarness, entityKey(key))
+      state[java.lang.Boolean](originalFunction, "syntheticEmptyBatchBaselineState").value() shouldEqual
+        java.lang.Boolean.TRUE
+      state[java.lang.Boolean](originalFunction, "syntheticRollbackCorrectionState").value() shouldEqual
+        java.lang.Boolean.TRUE
+      state[java.lang.Boolean](originalFunction, "pendingPublicationState").value() shouldEqual
+        java.lang.Boolean.TRUE
+    }
+    // Both keys share the day-aligned eviction cadence, so their correction timers coincide.
+    setCurrentKey(originalHarness, entityKey(firstKey))
+    val correctionTimer =
+      state[java.lang.Long](originalFunction, "nextProcessingEvictionTimerState").value().longValue()
+    val originalSnapshot = originalHarness.snapshot(50L, baselineProcessingTime)
+    originalHarness.close()
+
+    val markerBlindFunction = new MarkerBlindCorrectionConsumer(expectedTimer = Some(correctionTimer))
+    val markerBlindHarness = harness(markerBlindFunction)
+    markerBlindHarness.setup()
+    markerBlindHarness.initializeState(originalSnapshot)
+    markerBlindHarness.open()
+    markerBlindHarness.setProcessingTime(correctionTimer)
+    markerBlindFunction.correctionConsumed shouldBe true
+    val markerBlindSnapshot = markerBlindHarness.snapshot(51L, correctionTimer)
+    markerBlindHarness.close()
+
+    val restoredFunction = new GigaTileProcessFunction(batchBackedGroupBy,
+                                                       inputSchema,
+                                                       firstSeenKeyGraceMillis = graceMillis)
+    val restoredHarness = harness(restoredFunction)
+    try {
+      restoredHarness.setup()
+      restoredHarness.initializeState(markerBlindSnapshot)
+      restoredHarness.open()
+      restoredHarness.setProcessingTime(correctionTimer)
+      advanceConnectedHealthyLiveWatermark(restoredHarness, correctionTimer)
+      restoredHarness.processElement1(event(firstKey, eventTime + 2L, 0L), eventTime + 2L)
+      restoredHarness.processElement1(event(secondKey, eventTime + 2L, 0L), eventTime + 2L)
+
+      Seq(firstKey, secondKey).foreach { key =>
+        setCurrentKey(restoredHarness, entityKey(key))
+        withClue(s"synthetic baseline for $key should be dropped after marker-blind rollback: ") {
+          state[Array[Byte]](restoredFunction, "batchIrState").value() shouldBe null
+          state[java.lang.Boolean](restoredFunction, "syntheticEmptyBatchBaselineState").value() shouldBe null
+          state[java.lang.Boolean](restoredFunction, "syntheticRollbackCorrectionState").value() shouldBe null
+          state[java.lang.Boolean](restoredFunction, "pendingEmptyBatchBaselineState").value() shouldEqual
+            java.lang.Boolean.TRUE
+        }
+      }
+    } finally restoredHarness.close()
+  }
+
   it should "restart grace after marker-blind rollback consumes a newer fenced synthetic update" in {
     val graceMillis = oneHour
     val startProcessingTime = tenDays + oneHour

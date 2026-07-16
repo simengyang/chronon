@@ -207,18 +207,29 @@ class GigaTileProcessFunction(
       pendingEmptyBatchBaselineState.clear()
       flinkStore.clearSyntheticBatchIr()
       syntheticRollbackCorrectionState.clear()
-    } else if (emptyBatchBaselineSafeAfterMillis == null) {
+    } else {
       // A pre-fallback binary understands pendingPublicationState but not the two synthetic
       // markers. If it cleared pending state, it already handed off the null-fenced correction;
       // do not resurrect synthetic availability when rolling forward again. The correction
       // marker may itself be clear when the rollback checkpoint captured a newer fenced update.
+      //
+      // This reconciliation reads only per-key state, so it must run for every key on the
+      // subtask, not just the first callback that seeds the operator-wide grace clock below.
+      // While synthetic availability is present, this binary keeps the pending marker armed
+      // (completePublicationHandoff), so `hasSyntheticBatchIr && !hasRawPendingPublication` is
+      // reachable only via an external marker-blind binary — making it safe to check every call.
       if (flinkStore.hasSyntheticBatchIr && !hasRawPendingPublication) {
         flinkStore.clearSyntheticBatchIr()
         syntheticRollbackCorrectionState.clear()
       }
-      emptyBatchBaselineSafeAfterMillis =
-        if (currentProcessingTime > Long.MaxValue - firstSeenKeyGraceMillis) Long.MaxValue
-        else currentProcessingTime + firstSeenKeyGraceMillis
+      // The grace clock is deliberately operator-local (see field docs) and seeded once per
+      // restore, so a fresh delay covers every key before an unseen batch row is treated as
+      // empty history.
+      if (emptyBatchBaselineSafeAfterMillis == null) {
+        emptyBatchBaselineSafeAfterMillis =
+          if (currentProcessingTime > Long.MaxValue - firstSeenKeyGraceMillis) Long.MaxValue
+          else currentProcessingTime + firstSeenKeyGraceMillis
+      }
     }
   }
 
