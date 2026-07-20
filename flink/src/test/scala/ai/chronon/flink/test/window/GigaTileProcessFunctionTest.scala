@@ -209,11 +209,14 @@ class GigaTileProcessFunctionTest extends AnyFlatSpec with Matchers {
     } finally testHarness.close()
   }
 
-  it should "drop a future event before it can poison batch-backed large-window state" in {
+  it should "clamp a future event to processing time without dropping it" in {
     val dayMillis = new Window(1, TimeUnit.DAYS).millis
     val batchGroupBy = Builders.GroupBy(
       metaData = Builders.MetaData(name = "gigatile-process-function-future-event-test"),
-      aggregations = Seq(Builders.Aggregation(Operation.SUM, "num", Seq(new Window(7, TimeUnit.DAYS)))))
+      aggregations = Seq(
+        Builders.Aggregation(Operation.SUM, "num", Seq(new Window(7, TimeUnit.DAYS))),
+        Builders.Aggregation(Operation.MAX, Constants.TimeColumn, Seq(new Window(7, TimeUnit.DAYS)))
+      ))
     val testHarness = harness(new GigaTileProcessFunction(batchGroupBy, inputSchema))
     val currentProcessingTime = 10 * dayMillis + new Window(1, TimeUnit.HOURS).millis
     val batchCallbackTime = currentProcessingTime - 2L
@@ -229,12 +232,20 @@ class GigaTileProcessFunctionTest extends AnyFlatSpec with Matchers {
       testHarness.setProcessingTime(currentProcessingTime)
       advanceToHealthyLiveWatermark(testHarness, currentProcessingTime)
       testHarness.processElement1(event(currentProcessingTime + 1L, 11L), currentProcessingTime + 1L)
+
+      val outputsAfterFutureEvent = testHarness.extractOutputValues()
+      outputsAfterFutureEvent.size() shouldEqual 2
+      decodeSum(outputsAfterFutureEvent.get(1), batchGroupBy) shouldEqual 14L
+      decodeOutputField(outputsAfterFutureEvent.get(1), batchGroupBy, 1) shouldEqual currentProcessingTime
+      outputsAfterFutureEvent.get(1).latestTsMillis shouldEqual currentProcessingTime
+
       testHarness.processElement1(event(currentProcessingTime - 1000L, 5L), currentProcessingTime - 1000L)
+      testHarness.setProcessingTime(currentProcessingTime + 1L)
 
       val outputs = testHarness.extractOutputValues()
-      outputs.size() shouldEqual 2
-      decodeSum(outputs.get(1), batchGroupBy) shouldEqual 8L
-      outputs.get(1).latestTsMillis shouldEqual currentProcessingTime
+      outputs.size() shouldEqual 3
+      decodeSum(outputs.get(2), batchGroupBy) shouldEqual 19L
+      outputs.get(2).latestTsMillis shouldEqual currentProcessingTime + 1L
     } finally testHarness.close()
   }
 
@@ -244,22 +255,27 @@ class GigaTileProcessFunctionTest extends AnyFlatSpec with Matchers {
     val historicalEventTime = processingTs - 1000L
     val poisonedWatermark = processingTs - FlinkJob.AllowedOutOfOrderness.toMillis
     val retryTime = processingTs + 2L * FlinkJob.AutoWatermarkInterval
+    val firstKey = "entity-a"
+    val secondKey = "entity-b"
 
     try {
       testHarness.open()
       testHarness.setProcessingTime(processingTs)
       testHarness.processWatermarkStatus2(WatermarkStatus.IDLE)
-      testHarness.processElement1(event(futureEventTime, 11L), futureEventTime)
+      testHarness.processElement1(keyedEvent(firstKey, futureEventTime, 11L), futureEventTime)
+      testHarness.processElement1(keyedEvent(secondKey, futureEventTime, 13L), futureEventTime)
       testHarness.processWatermark1(new Watermark(poisonedWatermark))
-      testHarness.processElement1(event(historicalEventTime, 5L), historicalEventTime)
+      testHarness.processElement1(keyedEvent(firstKey, historicalEventTime, 5L), historicalEventTime)
+      testHarness.processElement1(keyedEvent(secondKey, historicalEventTime, 7L), historicalEventTime)
 
       testHarness.extractOutputValues() shouldBe empty
       testHarness.setProcessingTime(retryTime)
 
-      val outputs = testHarness.extractOutputValues()
-      outputs should have size 1
-      decodeSum(outputs.get(0)) shouldEqual 5L
-      outputs.get(0).latestTsMillis shouldEqual retryTime
+      val outputs = testHarness.extractOutputValues().asScala
+      outputs should have size 2
+      outputs.map(output => output.keys.get(0).toString -> decodeSum(output)).toMap shouldEqual
+        Map(firstKey -> 16L, secondKey -> 20L)
+      outputs.foreach(_.latestTsMillis shouldEqual retryTime)
     } finally testHarness.close()
   }
 
@@ -340,13 +356,13 @@ class GigaTileProcessFunctionTest extends AnyFlatSpec with Matchers {
       currentFinalizedSum(function) shouldEqual 7L
       currentDayStart(function) shouldEqual 4 * dayMillis
 
-      // Any future event is rejected before it can mutate either small- or large-window state.
+      // Clamp producer clock skew to processing time so the rows remain bounded without being lost.
       testHarness.processElement1(event(firstFutureEventTime, 11L), firstFutureEventTime)
       testHarness.processElement1(event(farFutureEventTime, 11L), farFutureEventTime)
-      currentFinalizedSum(function) shouldEqual 7L
+      currentFinalizedSum(function) shouldEqual 22L
       testHarness.setProcessingTime(nextEvictionHop(currentProcessingTime))
       testHarness.extractOutputValues() shouldBe empty
-      currentDayStart(function) shouldEqual 4 * dayMillis
+      currentDayStart(function) shouldEqual 10 * dayMillis
       testHarness.numProcessingTimeTimers() shouldEqual 1
     } finally testHarness.close()
   }
@@ -371,6 +387,55 @@ class GigaTileProcessFunctionTest extends AnyFlatSpec with Matchers {
       // observed finite event watermark, retain state rather than publish a partial row.
       testHarness.extractOutputValues() shouldBe empty
       testHarness.numProcessingTimeTimers() shouldEqual 1
+    } finally testHarness.close()
+  }
+
+  it should "keep every batch-backed key fenced when the batch input idles before its baseline arrives" in {
+    val dayMillis = new Window(1, TimeUnit.DAYS).millis
+    val batchGroupBy = Builders.GroupBy(
+      metaData = Builders.MetaData(name = "gigatile-process-function-partial-idle-bootstrap-test"),
+      aggregations = Seq(Builders.Aggregation(Operation.SUM, "num", Seq(new Window(7, TimeUnit.DAYS)))))
+    val function = new GigaTileProcessFunction(batchGroupBy, inputSchema)
+    val testHarness = harness(function)
+    val currentProcessingTime = 10 * dayMillis + new Window(1, TimeUnit.HOURS).millis
+    val batchEnd = 9 * dayMillis
+    val liveEventTime = currentProcessingTime - 1000L
+    val firstKey = "entity-a"
+    val secondKey = "entity-b"
+
+    try {
+      testHarness.open()
+      testHarness.setProcessingTime(currentProcessingTime)
+      advanceToHealthyLiveWatermark(testHarness, currentProcessingTime)
+      testHarness.processElement1(keyedEvent(firstKey, liveEventTime, 5L), liveEventTime)
+      testHarness.processElement1(keyedEvent(secondKey, liveEventTime, 7L), liveEventTime)
+
+      // Input 2 is idle and input 1 is live, but neither key has a batch baseline yet.
+      testHarness.extractOutputValues() shouldBe empty
+
+      testHarness.processElement2(
+        batchRow(batchGroupBy, batchEnd, batchEnd - 1000L, 3L, entity = firstKey),
+        batchEnd)
+
+      val outputs = testHarness.extractOutputValues()
+      outputs should have size 1
+      outputs.get(0).keys.get(0) shouldEqual firstKey
+      decodeSum(outputs.get(0), batchGroupBy) shouldEqual 8L
+
+      testHarness.setProcessingTime(nextEvictionHop(currentProcessingTime))
+      testHarness.extractOutputValues() should have size 1
+
+      val secondBatchProcessingTime = nextEvictionHop(currentProcessingTime) + 1L
+      testHarness.setProcessingTime(secondBatchProcessingTime)
+      advanceToHealthyLiveWatermark(testHarness, secondBatchProcessingTime)
+      testHarness.processElement2(
+        batchRow(batchGroupBy, batchEnd, batchEnd - 1000L, 4L, entity = secondKey),
+        batchEnd)
+
+      val finalOutputs = testHarness.extractOutputValues().asScala
+      finalOutputs should have size 2
+      finalOutputs.last.keys.get(0) shouldEqual secondKey
+      decodeSum(finalOutputs.last, batchGroupBy) shouldEqual 11L
     } finally testHarness.close()
   }
 
@@ -1901,8 +1966,12 @@ object GigaTileProcessFunctionTest {
   }
 
   private def decodeSum(tile: TimestampedTile, decodeGroupBy: GroupBy = groupBy): AnyRef = {
+    decodeOutputField(tile, decodeGroupBy, 0)
+  }
+
+  private def decodeOutputField(tile: TimestampedTile, decodeGroupBy: GroupBy, fieldIndex: Int): AnyRef = {
     val outputCodec = new GigaTileCodec(decodeGroupBy, inputSchema)
-    val fieldName = outputCodec.outputSchema.fields.head.name
+    val fieldName = outputCodec.outputSchema.fields(fieldIndex).name
     AvroCodec
       .of(ai.chronon.online.serde.AvroConversions.fromChrononSchema(outputCodec.outputSchema).toString)
       .decodeMap(tile.tileBytes)(fieldName)
@@ -1987,7 +2056,8 @@ object GigaTileProcessFunctionTest {
       batchGroupBy: GroupBy,
       batchEndTs: Long,
       batchEventTs: Long,
-      value: Long
+      value: Long,
+      entity: String = "campaign-1"
   ): BatchIrRow = {
     val batchAggregator =
       new SawtoothOnlineAggregator(batchEndTs, batchGroupBy.getAggregations.asScala.toSeq, inputSchema)
@@ -1995,7 +2065,9 @@ object GigaTileProcessFunctionTest {
       batchAggregator.init,
       new ArrayRow(Array[Any](batchEventTs, value), batchEventTs))
     val finalBatchIr = batchAggregator.denormalizeBatchIr(batchAggregator.normalizeBatchIr(batchIr))
-    new BatchIrRow(entityKey(), new GigaTileCodec(batchGroupBy, inputSchema).encodeBatchIr(finalBatchIr), batchEndTs)
+    new BatchIrRow(entityKey(entity),
+                   new GigaTileCodec(batchGroupBy, inputSchema).encodeBatchIr(finalBatchIr),
+                   batchEndTs)
   }
 
   private class LegacyEventTimeTimerFunction(timerTimestamps: Seq[Long])

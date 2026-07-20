@@ -60,7 +60,7 @@ class GigaTileProcessFunction(
 
   @transient private var eventProcessingErrorCounter: Counter = _
   @transient private var batchUpdateCounter: Counter = _
-  @transient private var futureEventDropCounter: Counter = _
+  @transient private var futureEventClampCounter: Counter = _
   @transient private var lastKey: java.util.List[Any] = _
   // Deliberately operator-local and not checkpointed. Recovery starts a fresh delay on its first
   // keyed callback before an unseen batch row can be treated as empty history.
@@ -104,7 +104,7 @@ class GigaTileProcessFunction(
       .addGroup("feature_group", groupBy.getMetaData.getName)
     eventProcessingErrorCounter = metricsGroup.counter("event_processing_error")
     batchUpdateCounter = metricsGroup.counter("batch_update_count")
-    futureEventDropCounter = metricsGroup.counter("future_event_drop_count")
+    futureEventClampCounter = metricsGroup.counter("future_event_clamp_count")
 
     tileState = getRuntimeContext.getMapState(
       new MapStateDescriptor[String, Array[Byte]]("giga-tile-tiles", classOf[String], classOf[Array[Byte]]))
@@ -200,13 +200,19 @@ class GigaTileProcessFunction(
   private def startEmptyBatchGrace(currentProcessingTime: Long): Unit = {
     if (!firstSeenKeyGraceEnabled) {
       // Synthetic availability lives outside the legacy batch-IR descriptor so both a config
-      // rollback and an older binary return to the normal null fence. Keep the legacy pending
-      // publication marker armed so the next callback retracts any synthetic value already
-      // handed to KV.
+      // rollback and an older binary return to the normal null fence. If the synthetic value
+      // reached KV, preserve its keyed correction marker until the null-fenced replacement is
+      // handed off.
+      val needsRollbackCorrection =
+        hasRawPendingPublication && (flinkStore.hasSyntheticBatchIr || hasSyntheticRollbackCorrection)
       emptyBatchBaselineSafeAfterMillis = null
       pendingEmptyBatchBaselineState.clear()
       flinkStore.clearSyntheticBatchIr()
-      syntheticRollbackCorrectionState.clear()
+      if (needsRollbackCorrection) {
+        syntheticRollbackCorrectionState.update(java.lang.Boolean.TRUE)
+      } else {
+        syntheticRollbackCorrectionState.clear()
+      }
     } else {
       // A pre-fallback binary understands pendingPublicationState but not the two synthetic
       // markers. If it cleared pending state, it already handed off the null-fenced correction;
@@ -340,20 +346,24 @@ class GigaTileProcessFunction(
     scheduleBufferedWriteTimerIfNeeded(timerService, versionMillis)
   }
 
-  private def isFutureEvent(eventTime: Long, currentProcessingTime: Long): Boolean =
-    eventTime > currentProcessingTime
-
   private def hasRawPendingPublication: Boolean =
     java.lang.Boolean.TRUE.equals(pendingPublicationState.value())
 
   private def hasSyntheticRollbackCorrection: Boolean =
     java.lang.Boolean.TRUE.equals(syntheticRollbackCorrectionState.value())
 
+  private def requiresNullBaselineCorrection: Boolean =
+    hasRawPendingPublication && hasSyntheticRollbackCorrection && !flinkStore.hasSyntheticBatchIr
+
   private def hasPendingPublication: Boolean =
-    hasRawPendingPublication && !hasSyntheticRollbackCorrection && pendingVersionCollisionState.value() == null
+    hasRawPendingPublication &&
+      (!hasSyntheticRollbackCorrection || requiresNullBaselineCorrection) &&
+      pendingVersionCollisionState.value() == null
 
   private def markPublicationPending(): Unit = {
-    syntheticRollbackCorrectionState.clear()
+    if (!requiresNullBaselineCorrection) {
+      syntheticRollbackCorrectionState.clear()
+    }
     pendingPublicationState.update(java.lang.Boolean.TRUE)
   }
 
@@ -494,6 +504,9 @@ class GigaTileProcessFunction(
       currentProcessingTime: Long
   ): Boolean = {
     val currentDayStart = flinkStore.getCurrentDayStart
+    val hasPublicationBaseline =
+      !processor.hasBatchBackedColumns || flinkStore.getBatchIr != null || requiresNullBaselineCorrection
+    hasPublicationBaseline &&
     ChrononClockMode.allowsPublication(mode) &&
     horizons.largeWindowAsOfMillis == currentProcessingTime &&
     !(currentDayStart >= 0L && flinkStore.getBatchEndTs > currentDayStart)
@@ -858,10 +871,8 @@ class GigaTileProcessFunction(
       if (processor == null) initializeTransients()
 
       val element = event.fields
-      val tsMills = Try(element(timeColumnAlias).asInstanceOf[Long])
+      val eventTimeMillis = Try(element(timeColumnAlias).asInstanceOf[Long])
         .getOrElse(element(timeColumnAlias).asInstanceOf[Double].toLong)
-      val values: Array[Any] = valueColumns.map(element(_))
-      val row = new ArrayRow(values, tsMills)
 
       ensureStateBound(ctx.getCurrentKey)
       val timerService = ctx.timerService()
@@ -869,26 +880,32 @@ class GigaTileProcessFunction(
       startEmptyBatchGrace(currentProcessingTime)
       repairExpiredProcessingTimerMarkers(timerService, currentProcessingTime, None)
       repairStaleBufferedWriteTimerIfNeeded(timerService, currentProcessingTime, None)
-      if (isFutureEvent(tsMills, currentProcessingTime)) {
-        futureEventDropCounter.inc()
-        return
-      }
+      val effectiveEventTimeMillis =
+        if (eventTimeMillis > currentProcessingTime) {
+          futureEventClampCounter.inc()
+          currentProcessingTime
+        } else {
+          eventTimeMillis
+        }
+      val values: Array[Any] =
+        valueColumns.map(column => if (column == timeColumnAlias) effectiveEventTimeMillis else element(column))
+      val row = new ArrayRow(values, effectiveEventTimeMillis)
       clearExpiredPublicationRetryMarker(currentProcessingTime, None)
       markEmptyBatchBaselinePendingIfNeeded()
       val eventTimeWatermark = timerService.currentWatermark()
       val mode = currentClockMode(currentProcessingTime, eventTimeWatermark)
       val horizons = ChrononClockMode.streamEventHorizons(mode,
-                                                          tsMills,
+                                                          effectiveEventTimeMillis,
                                                           currentProcessingTime,
                                                           eventTimeWatermark,
                                                           processor.minSmallWindowTileSize)
 
       val rolloverResult =
-        if (mode == NoWatermark) processor.advanceDayAsOf(tsMills)
+        if (mode == NoWatermark) processor.advanceDayAsOf(effectiveEventTimeMillis)
         else advanceDayForMode(mode, currentProcessingTime, eventTimeWatermark)
       val pendingRebuild = rebuildPendingAtCurrentTime(mode, horizons, currentProcessingTime)
       val eventResult = processor.onEvent(row,
-                                          tsMills,
+                                          effectiveEventTimeMillis,
                                           largeWindowAsOfTs = horizons.largeWindowAsOfMillis,
                                           smallWindowAsOfTs = horizons.smallWindowAsOfMillis)
       val callbackResult = preferLatestResult(eventResult, pendingRebuild.getOrElse(rolloverResult))

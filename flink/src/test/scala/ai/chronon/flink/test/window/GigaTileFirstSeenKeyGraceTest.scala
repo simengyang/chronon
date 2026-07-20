@@ -130,7 +130,7 @@ class GigaTileFirstSeenKeyGraceTest extends AnyFlatSpec with Matchers {
       testHarness.setProcessingTime(startProcessingTime)
       advanceConnectedHealthyLiveWatermark(testHarness, startProcessingTime)
       testHarness.processElement1(event(DefaultEntity, eventTime, 5L), eventTime)
-      decodeSum(testHarness.extractOutputValues().get(0), batchBackedGroupBy) shouldBe null
+      testHarness.extractOutputValues() shouldBe empty
 
       val batchProcessingTime = startProcessingTime + graceMillis / 2L
       testHarness.setProcessingTime(batchProcessingTime)
@@ -159,7 +159,7 @@ class GigaTileFirstSeenKeyGraceTest extends AnyFlatSpec with Matchers {
       testHarness.setProcessingTime(startProcessingTime)
       advanceConnectedHealthyLiveWatermark(testHarness, startProcessingTime)
       testHarness.processElement1(event(DefaultEntity, eventTime, 5L), eventTime)
-      decodeSum(testHarness.extractOutputValues().get(0), batchBackedGroupBy) shouldBe null
+      testHarness.extractOutputValues() shouldBe empty
 
       val baselineProcessingTime = startProcessingTime + 1L
       testHarness.setProcessingTime(baselineProcessingTime)
@@ -252,10 +252,6 @@ class GigaTileFirstSeenKeyGraceTest extends AnyFlatSpec with Matchers {
     val cadenceMillis = 100L
     val startProcessingTime = tenDays + oneHour
     val eventTime = startProcessingTime - 1000L
-    val firstCadence = nextBufferedWriteTick(batchBackedGroupBy,
-                                             entityKey(DefaultEntity),
-                                             startProcessingTime,
-                                             cadenceMillis)
     val originalFunction = new GigaTileProcessFunction(batchBackedGroupBy,
                                                        inputSchema,
                                                        bufferingOutputTimeMillis = cadenceMillis,
@@ -280,16 +276,17 @@ class GigaTileFirstSeenKeyGraceTest extends AnyFlatSpec with Matchers {
       restoredHarness.open()
       restoredHarness.setProcessingTime(startProcessingTime)
       advanceConnectedHealthyLiveWatermark(restoredHarness, startProcessingTime)
+      restoredHarness.processElement1(event(DefaultEntity, eventTime + 1L, 0L), eventTime + 1L)
 
-      // The restored cadence can flush the pre-grace null value, but must not install
-      // synthetic history or clear the keyed pending-grace marker.
-      restoredHarness.setProcessingTime(firstCadence)
+      // Restoring the pending key starts a fresh operator-local grace. It must not publish
+      // before a baseline is available, install synthetic history, or clear the keyed marker.
+      restoredHarness.extractOutputValues() shouldBe empty
       setCurrentKey(restoredHarness, entityKey(DefaultEntity))
       state[Array[Byte]](restoredFunction, "batchIrState").value() shouldBe null
       state[java.lang.Boolean](restoredFunction, "pendingEmptyBatchBaselineState").value() shouldEqual
         java.lang.Boolean.TRUE
 
-      val readyProcessingTime = firstCadence + graceMillis
+      val readyProcessingTime = startProcessingTime + graceMillis
       restoredHarness.setProcessingTime(readyProcessingTime)
       advanceConnectedHealthyLiveWatermark(restoredHarness, readyProcessingTime)
       restoredHarness.processElement1(event(DefaultEntity, readyProcessingTime - 1L, 0L), readyProcessingTime - 1L)
@@ -311,10 +308,13 @@ class GigaTileFirstSeenKeyGraceTest extends AnyFlatSpec with Matchers {
     } finally restoredHarness.close()
   }
 
-  it should "remove a restored synthetic baseline when the option is disabled" in {
+  it should "remove every restored synthetic baseline when the option is disabled" in {
     val graceMillis = 1000L
     val startProcessingTime = tenDays + oneHour
     val eventTime = startProcessingTime - 1000L
+    val firstKey = "entity-a"
+    val secondKey = "entity-b"
+    val keys = Seq(firstKey, secondKey)
     val originalFunction = new GigaTileProcessFunction(batchBackedGroupBy,
                                                        inputSchema,
                                                        firstSeenKeyGraceMillis = graceMillis)
@@ -323,20 +323,27 @@ class GigaTileFirstSeenKeyGraceTest extends AnyFlatSpec with Matchers {
     originalHarness.open()
     originalHarness.setProcessingTime(startProcessingTime)
     advanceConnectedHealthyLiveWatermark(originalHarness, startProcessingTime)
-    originalHarness.processElement1(event(DefaultEntity, eventTime, 5L), eventTime)
+    originalHarness.processElement1(event(firstKey, eventTime, 5L), eventTime)
+    originalHarness.processElement1(event(secondKey, eventTime, 7L), eventTime)
     val baselineProcessingTime = startProcessingTime + graceMillis + 1L
     originalHarness.setProcessingTime(baselineProcessingTime)
     advanceConnectedHealthyLiveWatermark(originalHarness, baselineProcessingTime)
-    originalHarness.processElement1(event(DefaultEntity, eventTime + 1L, 0L), eventTime + 1L)
-    decodeSum(originalHarness.extractOutputValues().asScala.last, batchBackedGroupBy) shouldEqual 5L
-    setCurrentKey(originalHarness, entityKey(DefaultEntity))
-    state[Array[Byte]](originalFunction, "batchIrState").value() shouldBe null
-    state[java.lang.Boolean](originalFunction, "syntheticEmptyBatchBaselineState").value() shouldEqual
-      java.lang.Boolean.TRUE
-    state[java.lang.Boolean](originalFunction, "pendingPublicationState").value() shouldEqual
-      java.lang.Boolean.TRUE
-    state[java.lang.Boolean](originalFunction, "syntheticRollbackCorrectionState").value() shouldEqual
-      java.lang.Boolean.TRUE
+    originalHarness.processElement1(event(firstKey, eventTime + 1L, 0L), eventTime + 1L)
+    originalHarness.processElement1(event(secondKey, eventTime + 1L, 0L), eventTime + 1L)
+    originalHarness.extractOutputValues().asScala
+      .map(output => output.keys.get(0).toString -> decodeSum(output, batchBackedGroupBy))
+      .toMap shouldEqual Map(firstKey -> 5L, secondKey -> 7L)
+    keys.foreach { key =>
+      setCurrentKey(originalHarness, entityKey(key))
+      state[Array[Byte]](originalFunction, "batchIrState").value() shouldBe null
+      state[java.lang.Boolean](originalFunction, "syntheticEmptyBatchBaselineState").value() shouldEqual
+        java.lang.Boolean.TRUE
+      state[java.lang.Boolean](originalFunction, "pendingPublicationState").value() shouldEqual
+        java.lang.Boolean.TRUE
+      state[java.lang.Boolean](originalFunction, "syntheticRollbackCorrectionState").value() shouldEqual
+        java.lang.Boolean.TRUE
+    }
+    setCurrentKey(originalHarness, entityKey(firstKey))
     val firstCorrectionTimer =
       state[java.lang.Long](originalFunction, "nextProcessingEvictionTimerState").value().longValue()
     val snapshot = originalHarness.snapshot(32L, baselineProcessingTime)
@@ -353,27 +360,102 @@ class GigaTileFirstSeenKeyGraceTest extends AnyFlatSpec with Matchers {
       // null-fenced correction so a C4 rollback cannot leave the old KV value serving.
       restoredHarness.setProcessingTime(firstCorrectionTimer)
       advanceConnectedHealthyLiveWatermark(restoredHarness, firstCorrectionTimer)
-      setCurrentKey(restoredHarness, entityKey(DefaultEntity))
-      state[java.lang.Boolean](restoredFunction, "syntheticEmptyBatchBaselineState").value() shouldBe null
-      state[java.lang.Boolean](restoredFunction, "syntheticRollbackCorrectionState").value() shouldBe null
-      state[java.lang.Boolean](restoredFunction, "pendingPublicationState").value() shouldEqual
-        java.lang.Boolean.TRUE
-      val liveCorrectionTimer =
+      val liveCorrectionTimers = keys.map { key =>
+        setCurrentKey(restoredHarness, entityKey(key))
+        state[java.lang.Boolean](restoredFunction, "syntheticEmptyBatchBaselineState").value() shouldBe null
+        state[java.lang.Boolean](restoredFunction, "syntheticRollbackCorrectionState").value() shouldEqual
+          java.lang.Boolean.TRUE
+        state[java.lang.Boolean](restoredFunction, "pendingPublicationState").value() shouldEqual
+          java.lang.Boolean.TRUE
         state[java.lang.Long](restoredFunction, "nextProcessingEvictionTimerState").value().longValue()
-      liveCorrectionTimer should be > firstCorrectionTimer
-      restoredHarness.setProcessingTime(liveCorrectionTimer - 1L)
-      advanceConnectedHealthyLiveWatermark(restoredHarness, liveCorrectionTimer)
-      restoredHarness.setProcessingTime(liveCorrectionTimer)
+      }
+      liveCorrectionTimers.foreach(_ should be > firstCorrectionTimer)
+      liveCorrectionTimers.distinct.sorted.foreach { liveCorrectionTimer =>
+        restoredHarness.setProcessingTime(liveCorrectionTimer - 1L)
+        advanceConnectedHealthyLiveWatermark(restoredHarness, liveCorrectionTimer)
+        restoredHarness.setProcessingTime(liveCorrectionTimer)
+      }
 
       val corrections = restoredHarness.extractOutputValues().asScala
-      corrections should have size 1
-      decodeSum(corrections.head, batchBackedGroupBy) shouldBe null
-      setCurrentKey(restoredHarness, entityKey(DefaultEntity))
-      state[Array[Byte]](restoredFunction, "batchIrState").value() shouldBe null
-      state[java.lang.Boolean](restoredFunction, "pendingEmptyBatchBaselineState").value() shouldBe null
-      state[java.lang.Boolean](restoredFunction, "syntheticEmptyBatchBaselineState").value() shouldBe null
-      state[java.lang.Boolean](restoredFunction, "pendingPublicationState").value() shouldBe null
-      state[java.lang.Boolean](restoredFunction, "syntheticRollbackCorrectionState").value() shouldBe null
+      corrections should have size 2
+      corrections.map(_.keys.get(0).toString).toSet shouldEqual keys.toSet
+      corrections.foreach { correction =>
+        decodeSum(correction, batchBackedGroupBy) shouldBe null
+      }
+      keys.foreach { key =>
+        setCurrentKey(restoredHarness, entityKey(key))
+        state[Array[Byte]](restoredFunction, "batchIrState").value() shouldBe null
+        state[java.lang.Boolean](restoredFunction, "pendingEmptyBatchBaselineState").value() shouldBe null
+        state[java.lang.Boolean](restoredFunction, "syntheticEmptyBatchBaselineState").value() shouldBe null
+        state[java.lang.Boolean](restoredFunction, "pendingPublicationState").value() shouldBe null
+        state[java.lang.Boolean](restoredFunction, "syntheticRollbackCorrectionState").value() shouldBe null
+      }
+    } finally restoredHarness.close()
+  }
+
+  it should "publish only baseline-safe corrections for live keys when the option is disabled" in {
+    val graceMillis = 1L
+    val startProcessingTime = tenDays + oneHour
+    val eventTime = startProcessingTime - 1000L
+    val firstKey = "entity-a"
+    val secondKey = "entity-b"
+    val initialValues = Map(firstKey -> 5L, secondKey -> 7L)
+    val mixedGroupBy = Builders.GroupBy(
+      metaData = Builders.MetaData(name = "gigatile-first-seen-mixed-window"),
+      aggregations = Seq(
+        Builders.Aggregation(Operation.MAX, "num", Seq(new Window(1, TimeUnit.HOURS))),
+        Builders.Aggregation(Operation.SUM, "num", Seq(new Window(7, TimeUnit.DAYS)))
+      ))
+    val originalFunction = new GigaTileProcessFunction(mixedGroupBy,
+                                                       inputSchema,
+                                                       firstSeenKeyGraceMillis = graceMillis)
+    val originalHarness = harness(originalFunction)
+
+    originalHarness.open()
+    originalHarness.setProcessingTime(startProcessingTime)
+    advanceConnectedHealthyLiveWatermark(originalHarness, startProcessingTime)
+    initialValues.foreach { case (key, value) =>
+      originalHarness.processElement1(event(key, eventTime, value), eventTime)
+    }
+    val baselineProcessingTime = startProcessingTime + graceMillis + 1L
+    originalHarness.setProcessingTime(baselineProcessingTime)
+    advanceConnectedHealthyLiveWatermark(originalHarness, baselineProcessingTime)
+    initialValues.keys.foreach { key =>
+      originalHarness.processElement1(event(key, eventTime + 1L, 0L), eventTime + 1L)
+    }
+    originalHarness.setProcessingTime(baselineProcessingTime + 1L)
+    val snapshot = originalHarness.snapshot(33L, baselineProcessingTime + 1L)
+    originalHarness.close()
+
+    val restoredFunction = new GigaTileProcessFunction(mixedGroupBy, inputSchema)
+    val restoredHarness = harness(restoredFunction)
+    try {
+      restoredHarness.setup()
+      restoredHarness.initializeState(snapshot)
+      restoredHarness.open()
+      val restoredProcessingTime = baselineProcessingTime + 2L
+      restoredHarness.setProcessingTime(restoredProcessingTime)
+      advanceConnectedHealthyLiveWatermark(restoredHarness, restoredProcessingTime)
+      initialValues.keys.foreach { key =>
+        restoredHarness.processElement1(event(key, restoredProcessingTime - 1L, 11L),
+                                        restoredProcessingTime - 1L)
+      }
+
+      val corrections = restoredHarness.extractOutputValues().asScala
+      corrections should have size 2
+      val correctionsByKey = corrections.map(correction => correction.keys.get(0).toString -> correction).toMap
+      correctionsByKey.keySet shouldEqual initialValues.keySet
+      initialValues.keys.foreach { key =>
+        decodeOutputField(correctionsByKey(key), mixedGroupBy, 0) shouldEqual 11L
+        decodeOutputField(correctionsByKey(key), mixedGroupBy, 1) shouldBe null
+      }
+
+      restoredHarness.setProcessingTime(restoredProcessingTime + 1L)
+      advanceConnectedHealthyLiveWatermark(restoredHarness, restoredProcessingTime + 1L)
+      initialValues.keys.foreach { key =>
+        restoredHarness.processElement1(event(key, restoredProcessingTime, 13L), restoredProcessingTime)
+      }
+      restoredHarness.extractOutputValues() should have size 2
     } finally restoredHarness.close()
   }
 
@@ -525,11 +607,16 @@ class GigaTileFirstSeenKeyGraceTest extends AnyFlatSpec with Matchers {
     originalHarness.setProcessingTime(startProcessingTime)
     advanceConnectedHealthyLiveWatermark(originalHarness, startProcessingTime)
     originalHarness.processElement1(event(DefaultEntity, eventTime, 5L), eventTime)
+    originalHarness.extractOutputValues() shouldBe empty
 
     val baselineProcessingTime = startProcessingTime + graceMillis + 1L
     originalHarness.setProcessingTime(baselineProcessingTime)
     advanceConnectedHealthyLiveWatermark(originalHarness, baselineProcessingTime)
     originalHarness.processElement1(event(DefaultEntity, eventTime + 1L, 0L), eventTime + 1L)
+    // Watermark activation and the event share one processing-time version. Flush their
+    // coalesced snapshot before asserting that the synthetic handoff is complete.
+    originalHarness.setProcessingTime(baselineProcessingTime + 1L)
+    decodeSum(originalHarness.extractOutputValues().asScala.last, batchBackedGroupBy) shouldEqual 5L
     setCurrentKey(originalHarness, entityKey(DefaultEntity))
     state[java.lang.Boolean](originalFunction, "syntheticEmptyBatchBaselineState").value() shouldEqual
       java.lang.Boolean.TRUE
@@ -646,6 +733,8 @@ class GigaTileFirstSeenKeyGraceTest extends AnyFlatSpec with Matchers {
       testHarness.extractOutputValues() shouldBe empty
 
       testHarness.setProcessingTime(collisionTime)
+      testHarness.extractOutputValues() shouldBe empty
+      testHarness.setProcessingTime(collisionTime + cadenceMillis)
 
       val outputs = testHarness.extractOutputValues()
       outputs should have size 1
@@ -725,7 +814,7 @@ class GigaTileFirstSeenKeyGraceTest extends AnyFlatSpec with Matchers {
       advanceConnectedHealthyLiveWatermark(testHarness, startProcessingTime)
       testHarness.processElement1(event(DefaultEntity, startProcessingTime - 1000L, 5L), startProcessingTime - 1000L)
 
-      decodeSum(testHarness.extractOutputValues().get(0), batchBackedGroupBy) shouldBe null
+      testHarness.extractOutputValues() shouldBe empty
       setCurrentKey(testHarness, entityKey(DefaultEntity))
       state[Array[Byte]](function, "batchIrState").value() shouldBe null
       state[java.lang.Boolean](function, "pendingEmptyBatchBaselineState").value() shouldBe null
@@ -935,8 +1024,12 @@ object GigaTileFirstSeenKeyGraceTest {
   }
 
   private def decodeSum(tile: TimestampedTile, targetGroupBy: GroupBy): AnyRef = {
+    decodeOutputField(tile, targetGroupBy, 0)
+  }
+
+  private def decodeOutputField(tile: TimestampedTile, targetGroupBy: GroupBy, fieldIndex: Int): AnyRef = {
     val outputCodec = new GigaTileCodec(targetGroupBy, inputSchema)
-    val fieldName = outputCodec.outputSchema.fields.head.name
+    val fieldName = outputCodec.outputSchema.fields(fieldIndex).name
     AvroCodec
       .of(ai.chronon.online.serde.AvroConversions.fromChrononSchema(outputCodec.outputSchema).toString)
       .decodeMap(tile.tileBytes)(fieldName)
